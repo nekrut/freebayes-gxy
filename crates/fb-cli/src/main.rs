@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use fb_core::{walk_record, AlleleKind, ReadFilter, Strand};
+use fb_core::{clump_observations, walk_record, AlleleKind, ReadFilter, Strand};
 use fb_vcf::{build_header, Contig};
 use rust_htslib::bam::{self, Read as _};
 use rust_htslib::faidx;
@@ -36,6 +36,20 @@ struct Cli {
     /// Emit a per-allele TSV instead of a VCF (M1 debug dump).
     #[arg(long = "dump-alleles")]
     dump_alleles: bool,
+
+    /// Maximum reference-run length (bp) allowed to bridge two flanking
+    /// non-reference events into a single COMPLEX allele (M2 clumping).
+    /// Set to a negative value to disable clumping. `--haplotype-length`
+    /// is the upstream freebayes CLI spelling and is accepted as an
+    /// alias. Use the `--flag=value` form for negative values, as clap
+    /// parses bare `-1` as a short flag.
+    #[arg(
+        long = "haplotype-length",
+        alias = "max-complex-gap",
+        default_value_t = 3,
+        value_name = "BP"
+    )]
+    haplotype_length: i64,
 
     /// Input BAM file (positional, matches upstream freebayes).
     #[arg(value_name = "BAM")]
@@ -150,6 +164,10 @@ fn run_dump_alleles(cli: &Cli) -> Result<()> {
                 continue;
             }
         };
+        // M2 clumping: collapse adjacent non-reference events (with up to
+        // `max_complex_gap` bp of intervening reference) into Complex
+        // alleles before aggregating for the TSV.
+        let observations = clump_observations(&observations, cli.haplotype_length);
         for obs in observations {
             if obs.allele.kind == AlleleKind::Null {
                 continue;

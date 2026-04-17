@@ -6,9 +6,11 @@
 //! depend on the types here.
 
 pub mod allele;
+pub mod haplotype;
 pub mod pileup;
 
 pub use allele::{Allele, AlleleKind, AlleleObservation, Strand};
+pub use haplotype::clump_observations;
 pub use pileup::{walk_alignment, walk_record, AlignmentView, ReadFilter};
 
 /// Milestone marker for the current build.
@@ -19,7 +21,7 @@ pub struct Milestone {
 
 impl Milestone {
     /// Current milestone — bumped as work lands.
-    pub const CURRENT: Self = Self { name: "M1" };
+    pub const CURRENT: Self = Self { name: "M2" };
 }
 
 /// Returns the current milestone tag.
@@ -32,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_milestone_is_m1() {
-        assert_eq!(current_milestone().name, "M1");
+    fn current_milestone_is_m2() {
+        assert_eq!(current_milestone().name, "M2");
     }
 }

@@ -172,3 +172,120 @@ fn dump_alleles_emits_snp_and_insertion_rows() {
         body
     );
 }
+
+/// Write a BAM with a single read whose CIGAR is `5M 1I 10M` and whose
+/// base at position 4 is a mismatch — i.e. an SNP immediately followed by
+/// an insertion. M2's clumping pass should fold these into one Complex
+/// observation.
+fn build_bam_snp_plus_ins(dir: &Path) -> std::path::PathBuf {
+    let bam_path = dir.join("cpx.bam");
+    let mut header = Header::new();
+    let mut sq = HeaderRecord::new(b"SQ");
+    sq.push_tag(b"SN", "chr1");
+    sq.push_tag(b"LN", REFERENCE.len() as u32);
+    header.push_record(&sq);
+
+    let mut writer =
+        bam::Writer::from_path(&bam_path, &header, bam::Format::Bam).expect("create writer");
+
+    // ref  = A C G T A C G T A C G T A C G T
+    // read = A C G T G   T   C G T A C G T A C G T (16 aligned + 1 inserted)
+    //        [---5M---] I1 [------10M------]
+    //                   ^   ^-- ref pos 5 ..= 14
+    //                   `- insertion anchored at ref pos 5
+    //                 ^-- SNP at ref pos 4 (A -> G)
+    let mut r = bam::Record::new();
+    let cigar = CigarString(vec![
+        bam::record::Cigar::Match(5),
+        bam::record::Cigar::Ins(1),
+        bam::record::Cigar::Match(10),
+    ]);
+    let seq = b"ACGTGTCGTACGTACG"; // 5M + 1I + 10M = 16 bases
+    let quals = vec![40u8; 16];
+    r.set(b"r_cpx", Some(&cigar), seq, &quals);
+    r.set_flags(0);
+    r.set_tid(0);
+    r.set_pos(0);
+    r.set_mapq(60);
+    r.set_mpos(-1);
+    r.set_mtid(-1);
+    r.set_insert_size(0);
+    writer.write(&r).unwrap();
+    bam_path
+}
+
+#[test]
+fn dump_alleles_clumps_adjacent_snp_and_insertion_into_complex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (fa, _fai) = write_fasta_with_index(tmp.path());
+    let bam = build_bam_snp_plus_ins(tmp.path());
+
+    // Default clumping: --haplotype-length 3.
+    let output = Command::new(cli_bin())
+        .arg("--dump-alleles")
+        .arg("-f")
+        .arg(&fa)
+        .arg(&bam)
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "CLI failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let body: Vec<&str> = stdout.lines().skip(1).collect();
+
+    // Expected: SNP(A→G) at ref 4 + INS("T") at ref 5 → one CPX row at
+    // 1-based pos 5, ref="A", alt="GT". Neither a standalone SNP row nor
+    // a standalone INS row should exist for those positions.
+    assert!(
+        body.iter().any(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            f[0] == "chr1"
+                && f[1] == "5"
+                && f[2] == "A"
+                && f[3] == "GT"
+                && f[4] == "CPX"
+                && f[5] == "1"
+        }),
+        "expected CPX row at 1-based pos 5 (A->GT), got: {:#?}",
+        body
+    );
+    assert!(
+        !body.iter().any(|l| l.contains("\tSNP\t")),
+        "standalone SNP row should have been absorbed into CPX, got: {:#?}",
+        body
+    );
+    assert!(
+        !body.iter().any(|l| l.contains("\tINS\t")),
+        "standalone INS row should have been absorbed into CPX, got: {:#?}",
+        body
+    );
+
+    // Same BAM, clumping disabled: expect SNP and INS rows, no CPX.
+    let output = Command::new(cli_bin())
+        .arg("--dump-alleles")
+        .arg("--haplotype-length=-1")
+        .arg("-f")
+        .arg(&fa)
+        .arg(&bam)
+        .output()
+        .expect("spawn cli");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let body: Vec<&str> = stdout.lines().skip(1).collect();
+    assert!(
+        !body.iter().any(|l| l.contains("\tCPX\t")),
+        "CPX row must not appear with clumping disabled, got: {:#?}",
+        body
+    );
+    assert!(
+        body.iter().any(|l| l.contains("\tSNP\t")),
+        "expected standalone SNP row with clumping disabled"
+    );
+    assert!(
+        body.iter().any(|l| l.contains("\tINS\t")),
+        "expected standalone INS row with clumping disabled"
+    );
+}

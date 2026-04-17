@@ -159,6 +159,41 @@ impl Allele {
             length,
         }
     }
+
+    /// Fold `other` into `self`, producing an [`AlleleKind::Complex`]
+    /// composite allele. Mirrors upstream `Allele::mergeAllele`
+    /// (`src/Allele.cpp:1454-1470`).
+    ///
+    /// Upstream concatenates `alternateSequence` and sums `length`; we do
+    /// the same and additionally concatenate `ref_seq` so the resulting
+    /// allele carries the full reference span. That matters because our
+    /// internal model keeps `ref_seq` empty for insertions and `alt_seq`
+    /// empty for deletions; the composite must express both sides of the
+    /// event so downstream consumers (M4's VCF anchor synthesis, M3's
+    /// likelihood model) see a complete REF/ALT pair.
+    ///
+    /// Position invariant: `self.position` is preserved — upstream
+    /// anchors the composite at the leftmost event, and
+    /// [`haplotype::clump_observations`](crate::haplotype::clump_observations)
+    /// builds composites by cloning the leftmost observation and folding
+    /// later ones in.
+    ///
+    /// Visibility is deliberately `pub(crate)`: this is an internal
+    /// helper for the clumping pipeline only; constructing Complex
+    /// alleles outside that context would skip upstream's bookkeeping
+    /// (CIGAR synthesis, flanking-base maintenance, left-alignment)
+    /// that M4 will need.
+    ///
+    /// **TODO(M4):** this does not synthesise a merged CIGAR
+    /// (upstream `mergeCigar`, `Allele.cpp:1468`) nor left-align the
+    /// resulting indel composite (`LeftAlign.cpp`). Both are required
+    /// before VCF emission.
+    pub(crate) fn merge_with(&mut self, other: &Allele) {
+        self.kind = AlleleKind::Complex;
+        self.ref_seq.extend_from_slice(&other.ref_seq);
+        self.alt_seq.extend_from_slice(&other.alt_seq);
+        self.length += other.length;
+    }
 }
 
 // Manual `Hash` so that (kind, position, ref, alt) uniquely key an allele —
