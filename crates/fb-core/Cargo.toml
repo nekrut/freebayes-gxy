@@ -10,5 +10,6 @@ description = "Core freebayes-gxy primitives: pileup, alleles, haplotypes, likel
 
 [dependencies]
 anyhow.workspace = true
+rust-htslib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

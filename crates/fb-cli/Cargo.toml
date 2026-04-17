@@ -22,3 +22,6 @@ tracing-subscriber.workspace = true
 
 fb-core = { path = "../fb-core" }
 fb-vcf = { path = "../fb-vcf" }
+
+[dev-dependencies]
+tempfile = "3"

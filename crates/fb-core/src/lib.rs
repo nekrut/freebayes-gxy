@@ -1,22 +1,25 @@
 //! Core primitives for freebayes-gxy.
 //!
-//! This crate will host the pileup engine, allele observation model, haplotype
-//! construction, and the building blocks of the Bayesian likelihood pipeline
-//! (see `PLAN.md` §4). M0 ships only a placeholder so the workspace compiles
-//! and `cargo test` has something to run.
+//! M1 hosts the allele observation model and the CIGAR walker that turns one
+//! aligned read into per-position [`AlleleObservation`]s. Haplotype
+//! construction (M2), the Bayesian genotype model (M3) and downstream crates
+//! depend on the types here.
+
+pub mod allele;
+pub mod pileup;
+
+pub use allele::{Allele, AlleleKind, AlleleObservation, Strand};
+pub use pileup::{walk_alignment, walk_record, AlignmentView, ReadFilter};
 
 /// Milestone marker for the current build.
-///
-/// M1 replaces this with real allele/pileup types. The struct is deliberately
-/// tiny so downstream crates can depend on `fb-core` from day one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Milestone {
     pub name: &'static str,
 }
 
 impl Milestone {
-    /// Current milestone for the workspace scaffolding.
-    pub const CURRENT: Self = Self { name: "M0" };
+    /// Current milestone — bumped as work lands.
+    pub const CURRENT: Self = Self { name: "M1" };
 }
 
 /// Returns the current milestone tag.
@@ -29,7 +32,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_milestone_is_m0() {
-        assert_eq!(current_milestone().name, "M0");
+    fn current_milestone_is_m1() {
+        assert_eq!(current_milestone().name, "M1");
     }
 }
