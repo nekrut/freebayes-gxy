@@ -1,42 +1,37 @@
 //! Bayesian genotype model for freebayes-gxy.
 //!
-//! In later milestones this crate hosts the port of freebayes' `Genotype.cpp`,
-//! `Multinomial.cpp`, and `Sum.cpp`, including the SIMD log-sum-exp kernel. M0
-//! ships only a placeholder so the workspace compiles.
+//! Ports the numerical core of freebayes' `Genotype.cpp` /
+//! `Multinomial.cpp` / `Sum.h` (and the log-space helpers from
+//! `Utility.cpp` that those depend on). M3 Phase A — this milestone —
+//! lands the reusable primitives:
+//!
+//! - [`mod@sum`] — linear and log-domain reductions.
+//! - [`mod@multinomial`] — factorial-ln, multinomial coefficient, sampling
+//!   probability.
+//! - [`mod@genotype`] — the [`Genotype`] data type and the
+//!   [`enumerate_genotypes`] multichoose port.
+//!
+//! Phase B (next) layers the per-read data likelihood
+//! (`DataLikelihood.cpp`) and the single-sample genotype posterior on
+//! top. Phase C wires it into the per-site pipeline so `fb-cli` can
+//! emit real VCF genotype calls.
+
+pub mod genotype;
+pub mod multinomial;
+pub mod sum;
+
+pub use genotype::{enumerate_genotypes, Genotype, GenotypeElement};
+pub use multinomial::{
+    factorial_ln, multinomial_coefficient_ln, multinomial_sampling_prob_ln, pow_ln,
+    sampling_prob_ln,
+};
+pub use sum::{log_add, log_sum_exp, sum, sum_i64};
 
 /// A numerically stable log-sum-exp over a pair of log-space values.
 ///
-/// This is the minimum viable primitive we need in the genotype model; it is
-/// exercised by the unit test below so the crate contributes to `cargo test`
-/// from M0 onward. Later milestones replace callers of this with a vectorised
-/// implementation.
+/// Retained as a deprecated alias for the [`log_add`] helper in
+/// [`mod@sum`] — removes in M3 Phase B.
+#[deprecated(since = "0.0.1", note = "use fb_genotype::log_add instead")]
 pub fn logsumexp2(a: f64, b: f64) -> f64 {
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    if hi == f64::NEG_INFINITY {
-        return hi;
-    }
-    hi + (1.0 + (lo - hi).exp()).ln()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn logsumexp2_matches_naive_for_normal_values() {
-        let a: f64 = -1.5;
-        let b: f64 = -0.25;
-        let naive = (a.exp() + b.exp()).ln();
-        let got = logsumexp2(a, b);
-        assert!((got - naive).abs() < 1e-12, "got {got}, naive {naive}");
-    }
-
-    #[test]
-    fn logsumexp2_handles_neg_infinity() {
-        assert_eq!(
-            logsumexp2(f64::NEG_INFINITY, f64::NEG_INFINITY),
-            f64::NEG_INFINITY
-        );
-        assert!((logsumexp2(f64::NEG_INFINITY, 0.0) - 0.0).abs() < 1e-12);
-    }
+    log_add(a, b)
 }

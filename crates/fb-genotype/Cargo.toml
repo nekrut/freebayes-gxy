@@ -10,5 +10,8 @@ description = "Bayesian genotype model, priors, and log-sum-exp kernels for free
 
 [dependencies]
 anyhow.workspace = true
+libm = "0.2"
 thiserror.workspace = true
 tracing.workspace = true
+
+fb-core = { path = "../fb-core" }

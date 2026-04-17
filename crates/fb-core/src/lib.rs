@@ -21,7 +21,7 @@ pub struct Milestone {
 
 impl Milestone {
     /// Current milestone — bumped as work lands.
-    pub const CURRENT: Self = Self { name: "M2" };
+    pub const CURRENT: Self = Self { name: "M3" };
 }
 
 /// Returns the current milestone tag.
@@ -34,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_milestone_is_m2() {
-        assert_eq!(current_milestone().name, "M2");
+    fn current_milestone_is_m3() {
+        assert_eq!(current_milestone().name, "M3");
     }
 }
