@@ -1,0 +1,24 @@
+[package]
+name = "fb-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "freebayes-gxy command-line interface."
+
+[[bin]]
+name = "freebayes-gxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rust-htslib.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+fb-core = { path = "../fb-core" }
+fb-vcf = { path = "../fb-vcf" }

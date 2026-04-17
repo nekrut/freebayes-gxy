@@ -1,0 +1,2 @@
+# Pin lint MSRV to the workspace MSRV so clippy suggestions stay compatible.
+msrv = "1.80"

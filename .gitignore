@@ -1,0 +1,30 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Generated / large test artifacts
+*.vcf.gz
+*.vcf.gz.tbi
+*.bcf
+*.bcf.csi
+*.bam
+*.bai
+*.cram
+*.crai
+*.fa.fai
+*.fa.gzi
+
+# Profiling / coverage
+perf.data*
+*.profraw
+*.profdata
+/coverage
+
+# Keep Cargo.lock tracked — this workspace ships a binary (freebayes-gxy).

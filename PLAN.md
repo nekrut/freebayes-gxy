@@ -102,10 +102,11 @@ No NIH of htslib. No custom allocators until profiling demands it.
 ## 5. Milestones
 
 ### M0 — Scaffolding (week 1)
-- Cargo workspace, CI (GitHub Actions: fmt/clippy/test/bench), hap.py Docker harness
+- Cargo workspace, CI (GitHub Actions: fmt/clippy/test)
 - `fb-cli` reads BAM + reference, prints a placeholder VCF header
-- Parity harness skeleton: run upstream v1.3.10 + freebayes-gxy, diff VCFs
-- **Exit criteria:** `cargo test` green; CI runs on push; baseline VCF captured for HG002 chr20 10 Mb window
+- Parity harness skeleton: `tests/parity/compare.sh` driving `bcftools isec`
+- **Exit criteria:** `cargo test` green; CI runs on push; `freebayes-gxy -f ref.fa aln.bam` emits a well-formed VCF 4.2 header
+- Deferred to later milestones: hap.py Docker harness → M7 (full WGS validation); baseline VCF capture for HG002 chr20 → first task of M1
 
 ### M1 — Pileup + allele observations (weeks 2–3)
 - Port `AlleleParser.cpp` semantics: read filtering, base quality handling, MNP/complex allele detection

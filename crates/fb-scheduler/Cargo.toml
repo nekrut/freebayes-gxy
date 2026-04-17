@@ -1,0 +1,15 @@
+[package]
+name = "fb-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Work-stealing window scheduler for parallel variant calling in freebayes-gxy."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rayon.workspace = true
