@@ -15,8 +15,6 @@
 //! `ALLELE_NULL` observations that upstream records for accounting are also
 //! deferred — the downstream Bayesian model (M3) does not consume them.
 
-#[cfg(test)]
-use crate::allele::AlleleKind;
 use crate::allele::{Allele, AlleleObservation, Strand};
 use rust_htslib::bam::record::{Cigar, CigarStringView};
 use rust_htslib::bam::Record;
@@ -344,38 +342,35 @@ fn walk_match_run(
     // upstream's `firstMatch` cursor (AlleleParser.cpp:1466-1488).
     let mut run_start: Option<(i64, usize)> = None;
 
-    let flush_ref_run = |out: &mut Vec<AlleleObservation>,
-                         run_start: &mut Option<(i64, usize)>,
-                         end_rp: usize,
-                         end_sp: i64| {
-        if let Some((start_sp, start_rp)) = run_start.take() {
-            let length = (end_sp - start_sp) as usize;
-            if length == 0 {
-                return;
+    let flush_ref_run =
+        |out: &mut Vec<AlleleObservation>, run_start: &mut Option<(i64, usize)>, end_sp: i64| {
+            if let Some((start_sp, start_rp)) = run_start.take() {
+                let length = (end_sp - start_sp) as usize;
+                if length == 0 {
+                    return;
+                }
+                let run_bases = read.seq[start_rp..start_rp + length].to_vec();
+                debug_assert_eq!(run_bases.len(), length);
+                out.push(AlleleObservation {
+                    allele: Allele::reference(start_sp, run_bases),
+                    read_name: read_name.to_string(),
+                    mapq,
+                    // Upstream stores `MAPPINGQUALITY` as the reference
+                    // allele's quality scalar (AlleleParser.cpp:1484, 1621);
+                    // we keep it as a scalar here — not multiplied by run
+                    // length — so single-observation math stays comparable.
+                    base_quality_sum: mapq as u32,
+                    strand,
+                    read_position: start_rp,
+                    is_proper_pair,
+                });
             }
-            let run_bases = read.seq[start_rp..start_rp + length].to_vec();
-            debug_assert_eq!(run_bases.len(), length);
-            out.push(AlleleObservation {
-                allele: Allele::reference(start_sp, run_bases),
-                read_name: read_name.to_string(),
-                mapq,
-                // Upstream stores `MAPPINGQUALITY` as the reference
-                // allele's quality scalar (AlleleParser.cpp:1484, 1621);
-                // we keep it as a scalar here — not multiplied by run
-                // length — so single-observation math stays comparable.
-                base_quality_sum: mapq as u32,
-                strand,
-                read_position: start_rp,
-                is_proper_pair,
-            });
-            let _ = end_rp; // end_rp used by caller when start_rp is set
-        }
-    };
+        };
 
     for _ in 0..len {
         if *rp >= read.seq.len() || *csp < 0 || *csp as usize >= ref_seq.len() {
             // Truncated read / ref; flush in-progress run and bail.
-            flush_ref_run(out, &mut run_start, *rp, *sp);
+            flush_ref_run(out, &mut run_start, *sp);
             return;
         }
         let read_base = read.seq[*rp];
@@ -392,7 +387,7 @@ fn walk_match_run(
         } else {
             // Flush any pending reference run first — upstream does the
             // same at AlleleParser.cpp:1466-1488.
-            flush_ref_run(out, &mut run_start, *rp, *sp);
+            flush_ref_run(out, &mut run_start, *sp);
 
             // Classify the mismatch. Upstream (AlleleParser.cpp:1515-1548)
             // emits either an ALLELE_SNP (for ATGC read bases) or an
@@ -432,7 +427,7 @@ fn walk_match_run(
 
     // Flush any trailing in-progress reference run at end of the CIGAR op.
     // Upstream does this at AlleleParser.cpp:1602-1624.
-    flush_ref_run(out, &mut run_start, *rp, *sp);
+    flush_ref_run(out, &mut run_start, *sp);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +461,7 @@ fn sum_u8(xs: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AlleleKind;
 
     fn view<'a>(
         seq: &'a [u8],
