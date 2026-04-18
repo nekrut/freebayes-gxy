@@ -42,6 +42,7 @@ use fb_core::AlleleObservation;
 
 use crate::genotype::Genotype;
 use crate::multinomial::multinomial_sampling_prob_ln;
+use crate::params::Parameters;
 
 /// Upstream freebayes' default read-dependence factor
 /// (`src/Parameters.cpp:475`). Exposed as a constant so callers can
@@ -63,8 +64,10 @@ pub fn phred_to_ln(q: u8) -> f64 {
 /// of upstream `probObservedAllelesGivenGenotype`
 /// (`src/DataLikelihood.cpp:26-43, 147-157`).
 ///
-/// `rdf` is the read-dependence factor; pass
-/// [`DEFAULT_READ_DEPENDENCE_FACTOR`] to match upstream defaults.
+/// `params.read_dependence_factor` drives the RDF scaling;
+/// `params.use_mapping_quality` gates the `max(ln_bq, ln_mq)`
+/// cap on outside-observation quality (upstream's
+/// `useMappingQuality` flag at `DataLikelihood.cpp:31`).
 ///
 /// Observations whose base quality is unknown should carry
 /// `base_quality_sum = 0` and will be treated as Phred 0 (error prob
@@ -81,7 +84,7 @@ pub fn phred_to_ln(q: u8) -> f64 {
 pub fn sample_log_likelihood(
     genotype: &Genotype,
     observations: &[AlleleObservation],
-    rdf: f64,
+    params: &Parameters,
 ) -> f64 {
     if observations.is_empty() {
         return 0.0;
@@ -108,12 +111,8 @@ pub fn sample_log_likelihood(
         if !matched {
             // Upstream uses `max(lnquality, lnmapQuality)` when
             // `useMappingQuality` is on (DataLikelihood.cpp:32-35), and
-            // `lnquality` alone otherwise (line 38). The port
-            // **unconditionally** applies the `max` — upstream's default
-            // Parameters struct ships with mapping-quality gating on,
-            // and Phase B has no Parameters plumbing yet. When the
-            // config surface lands (M3 Phase C), the gate must become
-            // conditional.
+            // `lnquality` alone otherwise (line 38). The gate is
+            // exposed via `Parameters::use_mapping_quality`.
             //
             // TODO(M3-indel): `base_quality_sum` is a per-base Q for
             // SNP / reference observations but a sum-across-bases for
@@ -124,11 +123,15 @@ pub fn sample_log_likelihood(
             // indel-BQ scaling port.
             let q = obs.base_quality_sum.min(u8::MAX as u32) as u8;
             let ln_bq = phred_to_ln(q);
-            let ln_mq = phred_to_ln(obs.mapq);
-            // In log-space, a larger (less negative) value means a
-            // higher error probability — taking `max` selects the
-            // less-informative quality, matching upstream's intent.
-            prod_q_out += ln_bq.max(ln_mq);
+            prod_q_out += if params.use_mapping_quality {
+                let ln_mq = phred_to_ln(obs.mapq);
+                // In log-space, a larger (less negative) value means a
+                // higher error probability — taking `max` selects the
+                // less-informative quality, matching upstream's intent.
+                ln_bq.max(ln_mq)
+            } else {
+                ln_bq
+            };
             count_out += 1;
         }
     }
@@ -138,7 +141,7 @@ pub fn sample_log_likelihood(
     // `DataLikelihood.cpp:147-149`.
     if count_out > 1 {
         let n = count_out as f64;
-        prod_q_out *= (1.0 + (n - 1.0) * rdf) / n;
+        prod_q_out *= (1.0 + (n - 1.0) * params.read_dependence_factor) / n;
     }
 
     let in_total: i64 = in_counts.iter().sum();
@@ -156,17 +159,17 @@ pub fn sample_log_likelihood(
 /// genotype set, returning a vector aligned with `genotypes`.
 ///
 /// This is the sample-level building block the M3 Phase C posterior
-/// code will aggregate. It's a thin wrapper over
-/// [`sample_log_likelihood`] that exists so callers don't have to
-/// rewrite the same loop at every site.
+/// code aggregates. It's a thin wrapper over [`sample_log_likelihood`]
+/// that exists so callers don't have to rewrite the same loop at every
+/// site.
 pub fn sample_log_likelihoods(
     genotypes: &[Genotype],
     observations: &[AlleleObservation],
-    rdf: f64,
+    params: &Parameters,
 ) -> Vec<f64> {
     genotypes
         .iter()
-        .map(|g| sample_log_likelihood(g, observations, rdf))
+        .map(|g| sample_log_likelihood(g, observations, params))
         .collect()
 }
 
@@ -175,6 +178,17 @@ mod tests {
     use super::*;
     use crate::genotype::enumerate_genotypes;
     use fb_core::{Allele, Strand};
+
+    /// Build a `Parameters` with the given RDF and upstream-default
+    /// `use_mapping_quality = true`. The tests in this module were
+    /// originally written against a bare `rdf: f64` argument; this
+    /// helper keeps them terse.
+    fn params(rdf: f64) -> Parameters {
+        Parameters {
+            read_dependence_factor: rdf,
+            ..Parameters::default()
+        }
+    }
 
     fn ref_allele() -> Allele {
         Allele::reference(100, vec![b'A'])
@@ -208,7 +222,7 @@ mod tests {
     #[test]
     fn empty_observations_returns_zero() {
         let gt = Genotype::from_alleles(vec![ref_allele(), ref_allele()]);
-        assert_eq!(sample_log_likelihood(&gt, &[], 0.9), 0.0);
+        assert_eq!(sample_log_likelihood(&gt, &[], &params(0.9)), 0.0);
     }
 
     #[test]
@@ -216,7 +230,7 @@ mod tests {
         let obs_set = vec![obs(ref_allele(), 60, 30); 10];
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 2);
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         // Find the indices of the three genotypes by tag.
         let mut hom_ref_ll = f64::NEG_INFINITY;
@@ -246,7 +260,7 @@ mod tests {
         }
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 2);
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         let (mut hom_ref_ll, mut het_ll, mut hom_alt_ll) =
             (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -269,7 +283,7 @@ mod tests {
         // With RDF=1 the outside sum is unscaled (`(1 + (n-1)*1)/n = 1`).
         let gt = Genotype::from_alleles(vec![snp_ag(), snp_ag()]);
         let obs_set = vec![obs(ref_allele(), 60, 30); 5];
-        let ll = sample_log_likelihood(&gt, &obs_set, 1.0);
+        let ll = sample_log_likelihood(&gt, &obs_set, &params(1.0));
         // prod_q_out = 5 * max(ln_bq, ln_mq). For Q=30 BQ and Q=60 MQ:
         // ln_bq = -3*ln10 ≈ -6.91; ln_mq = -6*ln10 ≈ -13.82; max = ln_bq.
         let expected = 5.0 * (-3.0 * std::f64::consts::LN_10);
@@ -289,9 +303,9 @@ mod tests {
         let gt = Genotype::from_alleles(vec![snp_ag(), snp_ag()]);
         let obs_set = vec![obs(ref_allele(), 60, 30); 10];
 
-        let ll_rdf_0 = sample_log_likelihood(&gt, &obs_set, 0.0);
-        let ll_rdf_default = sample_log_likelihood(&gt, &obs_set, 0.9);
-        let ll_rdf_1 = sample_log_likelihood(&gt, &obs_set, 1.0);
+        let ll_rdf_0 = sample_log_likelihood(&gt, &obs_set, &params(0.0));
+        let ll_rdf_default = sample_log_likelihood(&gt, &obs_set, &params(0.9));
+        let ll_rdf_1 = sample_log_likelihood(&gt, &obs_set, &params(1.0));
 
         // RDF=0 is the most lenient (closest to 0), RDF=1 the strictest.
         assert!(
@@ -318,8 +332,8 @@ mod tests {
         // affected by RDF.
         let gt = Genotype::from_alleles(vec![snp_ag(), snp_ag()]);
         let obs_set = vec![obs(ref_allele(), 60, 30)];
-        let ll_rdf_0 = sample_log_likelihood(&gt, &obs_set, 0.0);
-        let ll_rdf_1 = sample_log_likelihood(&gt, &obs_set, 1.0);
+        let ll_rdf_0 = sample_log_likelihood(&gt, &obs_set, &params(0.0));
+        let ll_rdf_1 = sample_log_likelihood(&gt, &obs_set, &params(1.0));
         assert!((ll_rdf_0 - ll_rdf_1).abs() < 1e-15);
     }
 
@@ -341,8 +355,8 @@ mod tests {
         let obs_q40 = vec![obs(ref_allele(), 60, 40)];
         let obs_q10 = vec![obs(ref_allele(), 60, 10)];
 
-        let ll_q40 = sample_log_likelihood(&gt, &obs_q40, 0.0);
-        let ll_q10 = sample_log_likelihood(&gt, &obs_q10, 0.0);
+        let ll_q40 = sample_log_likelihood(&gt, &obs_q40, &params(0.0));
+        let ll_q10 = sample_log_likelihood(&gt, &obs_q10, &params(0.0));
         assert!(
             ll_q40 < ll_q10,
             "Q=40 error ({ll_q40}) should be MORE penalising than Q=10 ({ll_q10})"
@@ -354,7 +368,7 @@ mod tests {
         let obs_set = vec![obs(ref_allele(), 60, 30); 20];
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 2);
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         let best_idx = lls
             .iter()
@@ -372,7 +386,7 @@ mod tests {
         obs_set.extend(vec![obs(snp_ag(), 60, 30); 15]);
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 2);
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         let best_idx = lls
             .iter()
@@ -396,7 +410,7 @@ mod tests {
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 4);
         assert_eq!(gts.len(), 5); // C(2+4-1, 4) = C(5, 4) = 5.
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         // Find hom-ref (all 4 refs) and pick the ML genotype.
         let (best_idx, _) = lls
@@ -426,7 +440,7 @@ mod tests {
 
         let gt = Genotype::from_alleles(vec![ref_allele(), snp_ag()]);
         // RDF=1 to skip the scaling and isolate the closed form.
-        let ll = sample_log_likelihood(&gt, &obs_set, 1.0);
+        let ll = sample_log_likelihood(&gt, &obs_set, &params(1.0));
 
         // Closed form:
         //   prod_q_out = 2 * max(phred2ln(30), phred2ln(60))
@@ -451,7 +465,7 @@ mod tests {
         let obs_set = vec![obs(snp_ag(), 60, 30); 20];
         let alleles = vec![ref_allele(), snp_ag()];
         let gts = enumerate_genotypes(&alleles, 2);
-        let lls = sample_log_likelihoods(&gts, &obs_set, 0.9);
+        let lls = sample_log_likelihoods(&gts, &obs_set, &params(0.9));
 
         let best_idx = lls
             .iter()
