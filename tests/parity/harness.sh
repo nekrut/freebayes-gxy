@@ -79,14 +79,21 @@ echo ""
 sort "$DIR/upstream.normalized.tsv" > "$DIR/upstream.sorted.tsv"
 sort "$DIR/gxy.normalized.tsv"      > "$DIR/gxy.sorted.tsv"
 
-if diff -u "$DIR/upstream.sorted.tsv" "$DIR/gxy.sorted.tsv" > "$DIR/diff.txt"; then
+if diff "$DIR/upstream.sorted.tsv" "$DIR/gxy.sorted.tsv" > "$DIR/diff.txt"; then
     echo "==> PARITY: byte-identical on (chrom, pos, ref, alt, gt_tag)"
     rm -f "$DIR/diff.txt"
     exit 0
 else
-    n_diff=$(grep -c '^[<>]' "$DIR/diff.txt" || echo 0)
-    echo "==> PARITY DRIFT: $n_diff differing lines (see $DIR/diff.txt)"
+    # Count distinct lines that differ: both '<' and '>' are emitted
+    # per differing line in plain-diff output.
+    n_upstream_only=$(grep -c '^<' "$DIR/diff.txt" || echo 0)
+    n_gxy_only=$(grep -c '^>' "$DIR/diff.txt" || echo 0)
+    echo "==> PARITY DRIFT"
+    echo "    upstream-only lines: $n_upstream_only"
+    echo "    gxy-only lines:      $n_gxy_only"
+    echo "    full diff at $DIR/diff.txt"
     echo ""
+    echo "--- first 40 lines of diff ---"
     head -40 "$DIR/diff.txt"
     exit 3
 fi
