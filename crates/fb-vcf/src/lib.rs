@@ -52,15 +52,21 @@ pub fn build_header(reference: &str, contigs: &[Contig], sample: &str) -> String
     out.push_str("##INFO=<ID=RO,Number=1,Type=Integer,Description=\"Count of full observations of the reference haplotype.\">\n");
     out.push_str("##INFO=<ID=AO,Number=A,Type=Integer,Description=\"Count of full observations of this alternate haplotype.\">\n");
     out.push_str("##INFO=<ID=TYPE,Number=A,Type=String,Description=\"The type of allele, either snp, mnp, ins, del, or complex.\">\n");
+    out.push_str("##INFO=<ID=CIGAR,Number=A,Type=String,Description=\"The extended CIGAR representation of each alternate allele relative to REF.\">\n");
+    out.push_str("##INFO=<ID=QR,Number=1,Type=Integer,Description=\"Reference allele quality sum in phred\">\n");
+    out.push_str("##INFO=<ID=QA,Number=A,Type=Integer,Description=\"Alternate allele quality sum in phred\">\n");
     // FORMAT declarations.
     out.push_str("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n");
     out.push_str("##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read depth\">\n");
     out.push_str("##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allele depth — one value per allele (REF first)\">\n");
     out.push_str("##FORMAT=<ID=RO,Number=1,Type=Integer,Description=\"Reference-allele observation count\">\n");
+    out.push_str("##FORMAT=<ID=QR,Number=1,Type=Integer,Description=\"Reference-allele quality sum in Phred\">\n");
     out.push_str("##FORMAT=<ID=AO,Number=A,Type=Integer,Description=\"Alternate-allele observation count\">\n");
+    out.push_str("##FORMAT=<ID=QA,Number=A,Type=Integer,Description=\"Alternate-allele quality sum in Phred\">\n");
     out.push_str(
         "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype quality (Phred)\">\n",
     );
+    out.push_str("##FORMAT=<ID=GL,Number=G,Type=Float,Description=\"Genotype log-likelihoods, log10-scaled, in VCF-spec F(j/k) order\">\n");
     out.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t");
     out.push_str(sample);
     out.push('\n');
@@ -93,7 +99,10 @@ impl RecordKind {
 /// One VCF record ready for emission. Sequences are raw ATGC bytes; no
 /// anchor-base synthesis happens here — call [`synthesize_anchored`]
 /// on your internal (kind, position, ref_seq, alt_seq) tuple first.
-#[derive(Debug, Clone)]
+///
+/// [`Record::default`] gives a skeleton callers can pattern-update:
+/// empty chrom, pos 0, no alts, none of the optional fields set.
+#[derive(Debug, Clone, Default)]
 pub struct Record {
     pub chrom: String,
     /// 1-based position of the leftmost base in `ref_seq`.
@@ -116,6 +125,80 @@ pub struct Record {
     pub gq: f64,
     /// Per-allele type tag (one per alt, in the same order as `alts`).
     pub alt_kinds: Vec<RecordKind>,
+    /// Per-allele CIGAR string relative to REF (one per alt, in the
+    /// same order as `alts`). Empty → `CIGAR` INFO omitted.
+    pub cigars: Vec<String>,
+    /// Reference-allele base-quality sum (Phred). Emitted as `QR` in
+    /// INFO and FORMAT. `None` → field omitted.
+    pub qual_ref: Option<u32>,
+    /// Alternate-allele base-quality sums, one per alt (Phred).
+    /// Emitted as `QA`. Empty → `QA` INFO omitted.
+    pub qual_alt: Vec<u32>,
+    /// Genotype log-likelihoods in VCF spec order (log10). For biallelic
+    /// diploid, this is `[P(0/0), P(0/1), P(1/1)]`; for triallelic
+    /// diploid it is `[P(0/0), P(0/1), P(1/1), P(0/2), P(1/2), P(2/2)]`
+    /// per VCF 4.2 `F(j/k) = k*(k+1)/2 + j`. Emitted as `GL` in FORMAT.
+    /// `None` → field omitted.
+    pub genotype_log10_likelihoods: Option<Vec<f64>>,
+}
+
+/// VCF 4.2 genotype index for a sorted diploid (j, k) with j ≤ k.
+///
+/// `F(j/k) = k*(k+1)/2 + j`, with positions matching the VCF spec
+/// example: `0/0→0, 0/1→1, 1/1→2, 0/2→3, 1/2→4, 2/2→5`.
+///
+/// Ploidy > 2 requires the general VCF combinatorial formula which is
+/// not yet ported — we return `None` there so callers can decide
+/// whether to emit `GL` at all for higher-ploidy genotypes.
+pub fn vcf_gl_index(gt_indices: &[u8]) -> Option<usize> {
+    if gt_indices.len() != 2 {
+        return None;
+    }
+    let mut xs = [gt_indices[0] as usize, gt_indices[1] as usize];
+    xs.sort_unstable();
+    let (j, k) = (xs[0], xs[1]);
+    Some(k * (k + 1) / 2 + j)
+}
+
+/// Build a per-alt CIGAR string against the record's REF sequence.
+///
+/// Mirrors upstream's `CIGAR` INFO emission which packs each alt's
+/// edit path relative to REF as a minimal-character string:
+/// - `1X` for a single-base SNP
+/// - `<N>X` for an MNP of length N
+/// - `1M<N>I` for a plain insertion of N bases anchored on the ref base
+/// - `1M<N>D` for a plain deletion of N bases anchored on the ref base
+/// - `<N>M<I>I<K>X` etc. for complex events — we approximate with a
+///   single `<MAX(len_ref,len_alt)>M` for complex kind for now; the
+///   full alignment port lands with [`RecordKind::Complex`] refinement.
+pub fn alt_cigar(kind: RecordKind, ref_seq: &[u8], alt_seq: &[u8]) -> String {
+    match kind {
+        RecordKind::Snp => "1X".to_string(),
+        RecordKind::Mnp => format!("{}X", ref_seq.len()),
+        RecordKind::Ins => {
+            // Anchored: REF = anchor, ALT = anchor + N inserted.
+            let n_ins = alt_seq.len().saturating_sub(ref_seq.len());
+            format!("1M{n_ins}I")
+        }
+        RecordKind::Del => {
+            // Anchored: REF = anchor + N deleted, ALT = anchor.
+            let n_del = ref_seq.len().saturating_sub(alt_seq.len());
+            format!("1M{n_del}D")
+        }
+        RecordKind::Complex => {
+            // Placeholder: use the longer of the two as the M count
+            // with any length delta declared as an indel tail. This
+            // is not a minimal-edit CIGAR and will differ from
+            // upstream on complex events — TODO for M4 Phase C.
+            let m = ref_seq.len().min(alt_seq.len());
+            let diff = ref_seq.len() as i64 - alt_seq.len() as i64;
+            match diff.cmp(&0) {
+                std::cmp::Ordering::Equal => format!("{m}X"),
+                std::cmp::Ordering::Greater => format!("{m}M{}D", diff.unsigned_abs()),
+                std::cmp::Ordering::Less => format!("{m}M{}I", diff.unsigned_abs()),
+            }
+        }
+    }
 }
 
 /// Convert the freebayes-gxy internal `(kind, position, ref_seq, alt_seq)`
@@ -252,9 +335,30 @@ pub fn write_record(rec: &Record) -> String {
         .collect::<Vec<_>>()
         .join(",");
     let _ = write!(out, "TYPE={type_str}");
-    // FORMAT: fixed column set for M4 Phase A.
-    out.push_str("\tGT:DP:AD:RO:AO:GQ\t");
-    // Sample fields.
+    if !rec.cigars.is_empty() {
+        let _ = write!(out, ";CIGAR={}", rec.cigars.join(","));
+    }
+    if let Some(qr) = rec.qual_ref {
+        let _ = write!(out, ";QR={qr}");
+    }
+    if !rec.qual_alt.is_empty() {
+        let _ = write!(out, ";QA={}", comma_join_u32(&rec.qual_alt));
+    }
+    // FORMAT: decide columns based on which optional fields are present.
+    let mut fmt_fields = vec!["GT", "DP", "AD", "RO"];
+    if rec.qual_ref.is_some() {
+        fmt_fields.push("QR");
+    }
+    fmt_fields.push("AO");
+    if !rec.qual_alt.is_empty() {
+        fmt_fields.push("QA");
+    }
+    fmt_fields.push("GQ");
+    if rec.genotype_log10_likelihoods.is_some() {
+        fmt_fields.push("GL");
+    }
+    let _ = write!(out, "\t{}\t", fmt_fields.join(":"));
+    // Sample fields in the same order.
     let gt_str = rec
         .gt_indices
         .iter()
@@ -265,15 +369,24 @@ pub fn write_record(rec: &Record) -> String {
     ad.push(rec.ref_obs);
     ad.extend_from_slice(&rec.alt_obs);
     let gq_int = rec.gq.round() as i64;
-    let _ = write!(
-        out,
-        "{gt_str}:{dp}:{ad}:{ro}:{ao}:{gq}",
-        dp = rec.depth,
-        ad = comma_join_u32(&ad),
-        ro = rec.ref_obs,
-        ao = comma_join_u32(&rec.alt_obs),
-        gq = gq_int,
-    );
+
+    let mut sample_values: Vec<String> = Vec::with_capacity(fmt_fields.len());
+    sample_values.push(gt_str);
+    sample_values.push(rec.depth.to_string());
+    sample_values.push(comma_join_u32(&ad));
+    sample_values.push(rec.ref_obs.to_string());
+    if let Some(qr) = rec.qual_ref {
+        sample_values.push(qr.to_string());
+    }
+    sample_values.push(comma_join_u32(&rec.alt_obs));
+    if !rec.qual_alt.is_empty() {
+        sample_values.push(comma_join_u32(&rec.qual_alt));
+    }
+    sample_values.push(gq_int.to_string());
+    if let Some(gl) = &rec.genotype_log10_likelihoods {
+        sample_values.push(comma_join_f64(gl, 4));
+    }
+    out.push_str(&sample_values.join(":"));
     out.push('\n');
     out
 }
@@ -354,6 +467,7 @@ mod tests {
             gt_indices: vec![1, 1],
             gq: 39.0,
             alt_kinds: vec![RecordKind::Snp],
+            ..Record::default()
         };
         let line = write_record(&r);
         assert!(
@@ -368,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn write_record_het_snp() {
+    fn write_record_het_snp_with_gl() {
         let r = Record {
             chrom: "chr1".into(),
             pos: 201,
@@ -381,22 +495,29 @@ mod tests {
             gt_indices: vec![0, 1],
             gq: 60.0,
             alt_kinds: vec![RecordKind::Snp],
+            cigars: vec!["1X".into()],
+            qual_ref: Some(300),
+            qual_alt: vec![300],
+            genotype_log10_likelihoods: Some(vec![-13.1715, 0.0, -13.1715]),
         };
         let line = write_record(&r);
         assert!(line.contains("AC=1;AN=2;AF=0.500000;"));
         assert!(line.contains("RO=10;AO=10;"));
-        assert!(line.contains("\t0/1:20:10,10:10:10:60\n"));
+        assert!(line.contains("CIGAR=1X"));
+        assert!(line.contains("QR=300"));
+        assert!(line.contains("QA=300"));
+        assert!(line.contains("\tGT:DP:AD:RO:QR:AO:QA:GQ:GL\t"));
+        assert!(line.contains("0/1:20:10,10:10:300:10:300:60:-13.1715,0.0000,-13.1715"));
     }
 
     #[test]
     fn write_record_hom_ins_anchor_synthesised() {
-        // Internal: INS alt_seq = "TT" at 0-based pos 105, anchor 'A'.
         let (pos, refs, alts) = synthesize_anchored(RecordKind::Ins, 105, b"", b"TT", Some(b'A'));
         let r = Record {
             chrom: "chr1".into(),
             pos,
             ref_seq: refs,
-            alts: vec![alts],
+            alts: vec![alts.clone()],
             qual: Some(100.0),
             depth: 20,
             ref_obs: 0,
@@ -404,10 +525,13 @@ mod tests {
             gt_indices: vec![1, 1],
             gq: 60.0,
             alt_kinds: vec![RecordKind::Ins],
+            cigars: vec![alt_cigar(RecordKind::Ins, b"A", &alts)],
+            ..Record::default()
         };
         let line = write_record(&r);
         assert!(line.starts_with("chr1\t105\t.\tA\tATT\t100.000\tPASS\t"));
         assert!(line.contains("TYPE=ins"));
+        assert!(line.contains("CIGAR=1M2I"));
         assert!(line.contains("\t1/1:20:0,20:0:20:60\n"));
     }
 
@@ -417,7 +541,7 @@ mod tests {
         let r = Record {
             chrom: "chr1".into(),
             pos,
-            ref_seq: refs,
+            ref_seq: refs.clone(),
             alts: vec![alts],
             qual: Some(50.0),
             depth: 20,
@@ -426,11 +550,48 @@ mod tests {
             gt_indices: vec![0, 1],
             gq: 30.0,
             alt_kinds: vec![RecordKind::Del],
+            cigars: vec![alt_cigar(RecordKind::Del, &refs, b"T")],
+            ..Record::default()
         };
         let line = write_record(&r);
         assert!(line.starts_with("chr1\t200\t.\tTCC\tT\t50.000\tPASS\t"));
         assert!(line.contains("TYPE=del"));
+        assert!(line.contains("CIGAR=1M2D"));
         assert!(line.contains("\t0/1:20:10,10:10:10:30\n"));
+    }
+
+    #[test]
+    fn vcf_gl_index_biallelic_diploid() {
+        // 0/0 → 0, 0/1 → 1, 1/1 → 2.
+        assert_eq!(vcf_gl_index(&[0, 0]), Some(0));
+        assert_eq!(vcf_gl_index(&[0, 1]), Some(1));
+        assert_eq!(vcf_gl_index(&[1, 0]), Some(1)); // unsorted ok
+        assert_eq!(vcf_gl_index(&[1, 1]), Some(2));
+    }
+
+    #[test]
+    fn vcf_gl_index_triallelic_diploid_matches_spec_order() {
+        // Spec: 0/0=0, 0/1=1, 1/1=2, 0/2=3, 1/2=4, 2/2=5.
+        assert_eq!(vcf_gl_index(&[0, 0]), Some(0));
+        assert_eq!(vcf_gl_index(&[0, 1]), Some(1));
+        assert_eq!(vcf_gl_index(&[1, 1]), Some(2));
+        assert_eq!(vcf_gl_index(&[0, 2]), Some(3));
+        assert_eq!(vcf_gl_index(&[1, 2]), Some(4));
+        assert_eq!(vcf_gl_index(&[2, 2]), Some(5));
+    }
+
+    #[test]
+    fn vcf_gl_index_non_diploid_returns_none() {
+        assert_eq!(vcf_gl_index(&[0]), None);
+        assert_eq!(vcf_gl_index(&[0, 0, 0]), None);
+    }
+
+    #[test]
+    fn alt_cigar_kinds() {
+        assert_eq!(alt_cigar(RecordKind::Snp, b"A", b"G"), "1X");
+        assert_eq!(alt_cigar(RecordKind::Mnp, b"AC", b"GT"), "2X");
+        assert_eq!(alt_cigar(RecordKind::Ins, b"A", b"ATT"), "1M2I");
+        assert_eq!(alt_cigar(RecordKind::Del, b"ACC", b"A"), "1M2D");
     }
 
     #[test]

@@ -18,7 +18,10 @@ use fb_core::{
     clump_observations, walk_record, Allele, AlleleKind, AlleleObservation, ReadFilter, Strand,
 };
 use fb_genotype::{call_genotype, enumerate_genotypes, Parameters};
-use fb_vcf::{build_header, synthesize_anchored, write_record, Contig, Record, RecordKind};
+use fb_vcf::{
+    alt_cigar, build_header, synthesize_anchored, vcf_gl_index, write_record, Contig, Record,
+    RecordKind,
+};
 use rust_htslib::bam::{self, Read as _};
 use rust_htslib::faidx;
 use tracing::{debug, info, warn};
@@ -498,6 +501,83 @@ fn call_site(
         })
         .collect();
 
+    // QR / QA: sum of base qualities for observations of each allele.
+    // Walk the observation list one more time matching against
+    // `alleles` (REF at index 0, alts at 1..). Upstream computes these
+    // in the calling context alongside the likelihood; our per-position
+    // pileup doesn't thread them through the caller yet, so recompute
+    // here. Cheap at realistic coverage.
+    let mut qual_ref: u32 = 0;
+    let mut qual_alt: Vec<u32> = vec![0; alt_obs.len()];
+    for obs in observations {
+        if let Some(idx) = alleles.iter().position(|a| a == &obs.allele) {
+            if idx == 0 {
+                qual_ref = qual_ref.saturating_add(obs.base_quality_sum);
+            } else {
+                qual_alt[idx - 1] = qual_alt[idx - 1].saturating_add(obs.base_quality_sum);
+            }
+        }
+    }
+
+    // GL: log10-scaled data likelihoods in VCF spec `F(j/k)` order.
+    // Our enumerate_genotypes produces non-decreasing index tuples via
+    // multichoose; the resulting order agrees with VCF spec for
+    // biallelic diploid but diverges for triallelic+. Use `vcf_gl_index`
+    // to remap into spec order.
+    let genotype_log10_likelihoods = if params.ploidy == 2 {
+        let mut slots: Vec<f64> = vec![f64::NAN; gts.len()];
+        let mut ok = true;
+        for (g_idx, g) in gts.iter().enumerate() {
+            let mut gt_indices_for_g: Vec<u8> = Vec::with_capacity(2);
+            for elem in &g.elements {
+                let allele_idx = alleles.iter().position(|a| a == &elem.allele).unwrap_or(0) as u8;
+                for _ in 0..elem.count {
+                    gt_indices_for_g.push(allele_idx);
+                }
+            }
+            match vcf_gl_index(&gt_indices_for_g) {
+                Some(slot) if slot < slots.len() => {
+                    // ln -> log10: divide by ln(10).
+                    slots[slot] = call.log_likelihoods[g_idx] / std::f64::consts::LN_10;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // Normalise so max = 0 (upstream convention).
+        if ok {
+            let max = slots.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if max.is_finite() {
+                for x in slots.iter_mut() {
+                    if x.is_finite() {
+                        *x -= max;
+                    }
+                }
+            }
+            Some(slots)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Per-alt CIGAR strings relative to the VCF-anchored REF/ALT pair.
+    // We synthesise the anchor here too so the CIGAR matches what
+    // `emit_call_vcf` will eventually emit.
+    let cigars: Vec<String> = alleles
+        .iter()
+        .skip(1)
+        .zip(alt_kinds.iter())
+        .map(|(alt, kind)| {
+            let (_pos, vcf_ref, vcf_alt) =
+                synthesize_anchored(*kind, pos, &alt.ref_seq, &alt.alt_seq, Some(ref_base));
+            alt_cigar(*kind, &vcf_ref, &vcf_alt)
+        })
+        .collect();
+
     Some(SiteCall {
         tid,
         pos,
@@ -508,8 +588,12 @@ fn call_site(
         gt_indices,
         genotype_quality: call.genotype_quality,
         qual,
+        qual_ref,
+        qual_alt,
         alt_alleles: alleles.into_iter().skip(1).collect(),
         alt_kinds,
+        cigars,
+        genotype_log10_likelihoods,
     })
 }
 
@@ -523,8 +607,12 @@ struct SiteCall {
     gt_indices: Vec<u8>,
     genotype_quality: f64,
     qual: Option<f64>,
+    qual_ref: u32,
+    qual_alt: Vec<u32>,
     alt_alleles: Vec<Allele>,
     alt_kinds: Vec<RecordKind>,
+    cigars: Vec<String>,
+    genotype_log10_likelihoods: Option<Vec<f64>>,
 }
 
 fn run_call(cli: &Cli) -> Result<()> {
@@ -690,6 +778,10 @@ fn emit_call_vcf(
             gt_indices: call.gt_indices.clone(),
             gq: call.genotype_quality,
             alt_kinds: call.alt_kinds.clone(),
+            cigars: call.cigars.clone(),
+            qual_ref: Some(call.qual_ref),
+            qual_alt: call.qual_alt.clone(),
+            genotype_log10_likelihoods: call.genotype_log10_likelihoods.clone(),
         };
         buf.extend_from_slice(write_record(&record).as_bytes());
 
