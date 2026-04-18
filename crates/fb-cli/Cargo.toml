@@ -21,6 +21,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 fb-core = { path = "../fb-core" }
+fb-genotype = { path = "../fb-genotype" }
 fb-vcf = { path = "../fb-vcf" }
 
 [dev-dependencies]

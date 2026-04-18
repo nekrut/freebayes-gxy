@@ -1,17 +1,22 @@
 //! `freebayes-gxy` CLI entry point.
 //!
-//! M0 shipped a BAM+FASTA opener that wrote a minimal VCF header. M1 adds
-//! `--dump-alleles`, which walks the BAM and emits a per-allele TSV summary
-//! using [`fb_core::walk_record`]. Variant calling proper arrives in M3–M4.
+//! Modes:
+//! - `--dump-alleles` (M1+M2): per-allele TSV summary.
+//! - `--call` (M3 Phase C-2): per-position pileup + Bayesian single-
+//!   sample genotype call, TSV output with GQ.
+//! - default: emits the M0 VCF header only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use fb_core::{clump_observations, walk_record, AlleleKind, ReadFilter, Strand};
+use fb_core::{
+    clump_observations, walk_record, Allele, AlleleKind, AlleleObservation, ReadFilter, Strand,
+};
+use fb_genotype::{call_genotype, enumerate_genotypes, Parameters};
 use fb_vcf::{build_header, Contig};
 use rust_htslib::bam::{self, Read as _};
 use rust_htslib::faidx;
@@ -36,6 +41,31 @@ struct Cli {
     /// Emit a per-allele TSV instead of a VCF (M1 debug dump).
     #[arg(long = "dump-alleles")]
     dump_alleles: bool,
+
+    /// Run the single-sample Bayesian caller and emit a per-site TSV
+    /// (M3 Phase C-2). Mutually exclusive with `--dump-alleles`.
+    #[arg(long = "call", conflicts_with = "dump_alleles")]
+    call: bool,
+
+    /// Ploidy for the Bayesian caller (upstream default: 2).
+    #[arg(long = "ploidy", default_value_t = 2, value_name = "N")]
+    ploidy: u32,
+
+    /// Minimum count of non-reference observations at a site for it to
+    /// be considered a candidate. Upstream
+    /// `--min-alternate-count` default is 2.
+    #[arg(long = "min-alternate-count", default_value_t = 2, value_name = "N")]
+    min_alternate_count: u32,
+
+    /// Minimum fraction of non-reference observations at a site for it
+    /// to be considered a candidate. Upstream
+    /// `--min-alternate-fraction` default is 0.05.
+    #[arg(
+        long = "min-alternate-fraction",
+        default_value_t = 0.05,
+        value_name = "F"
+    )]
+    min_alternate_fraction: f64,
 
     /// Maximum reference-run length (bp) allowed to bridge two flanking
     /// non-reference events into a single COMPLEX allele (M2 clumping).
@@ -72,7 +102,9 @@ fn main() -> Result<()> {
         "freebayes-gxy starting"
     );
 
-    if cli.dump_alleles {
+    if cli.call {
+        run_call(&cli)
+    } else if cli.dump_alleles {
         run_dump_alleles(&cli)
     } else {
         run_emit_header(&cli)
@@ -287,6 +319,286 @@ fn read_bam_contigs(path: &Path) -> Result<Vec<Contig>> {
         out.push(Contig { name, length });
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// M3 Phase C-2: per-position pileup + Bayesian caller
+// ---------------------------------------------------------------------------
+
+/// Per-position pileup of allele observations.
+///
+/// Reference runs from the M1 CIGAR walker cover many positions with a
+/// single observation; this aggregator **decomposes** each ref run into
+/// per-position single-base Reference observations so the genotype
+/// model can count per-site depth correctly. Non-reference observations
+/// (SNP, INS, DEL, Complex) are bucketed at their anchor position
+/// as-is.
+///
+/// **Quality scalar caveat:** decomposed per-position Reference
+/// observations inherit the parent run's `base_quality_sum`, which the
+/// M1 walker sets to the read's `mapq` (upstream's convention — see
+/// `fb_core::pileup::walk_match_run`). That is accurate for
+/// single-observation math but does not recover per-base BQ for the
+/// run's interior. Fixing this is a Phase C-3 / M4 task: either emit
+/// per-position Reference observations from the walker directly, or
+/// cache per-base BQs on the run and index them here.
+///
+/// Memory cost: O(total aligned bases). Fine for synthetic test inputs
+/// and small regions; a streaming or interval-tree backed aggregator is
+/// a Phase C-3 optimisation for full-WGS runs.
+#[derive(Default)]
+struct Pileup {
+    positions: BTreeMap<(i32, i64), Vec<AlleleObservation>>,
+}
+
+impl Pileup {
+    fn add_read_observations(&mut self, tid: i32, observations: Vec<AlleleObservation>) {
+        for obs in observations {
+            match obs.allele.kind {
+                AlleleKind::Reference => {
+                    // Decompose the ref run into per-position
+                    // single-base Reference observations. The run's
+                    // `ref_seq` is the aligned read bases (which equal
+                    // the ref bases by construction — see `Allele::
+                    // reference` in fb-core).
+                    for offset in 0..obs.allele.length {
+                        let pos = obs.allele.position + offset as i64;
+                        let byte = obs.allele.ref_seq[offset];
+                        let per_pos = AlleleObservation {
+                            allele: Allele::reference(pos, vec![byte]),
+                            read_name: obs.read_name.clone(),
+                            mapq: obs.mapq,
+                            base_quality_sum: obs.base_quality_sum,
+                            strand: obs.strand,
+                            read_position: obs.read_position + offset,
+                            is_proper_pair: obs.is_proper_pair,
+                        };
+                        self.positions.entry((tid, pos)).or_default().push(per_pos);
+                    }
+                }
+                AlleleKind::Null => {
+                    // Soft-clip / N-base observations don't inform the
+                    // Bayesian model; drop them at the pileup stage.
+                }
+                _ => {
+                    self.positions
+                        .entry((tid, obs.allele.position))
+                        .or_default()
+                        .push(obs);
+                }
+            }
+        }
+    }
+}
+
+/// Given a position's observation bucket, assemble the candidate
+/// allele set (reference + distinct variants meeting the min-count /
+/// min-fraction thresholds) and run the Bayesian caller.
+fn call_site(
+    tid: i32,
+    pos: i64,
+    observations: &[AlleleObservation],
+    ref_base: u8,
+    cli: &Cli,
+    params: &Parameters,
+) -> Option<SiteCall> {
+    // Collect candidate variant alleles with their observation counts.
+    // `Allele` implements `Hash` + `Eq` (but not `Ord`), so use a HashMap.
+    //
+    // NOTE(M4): HashMap iteration order is non-deterministic, so the
+    // ordering of ALT alleles in the TSV can differ between runs at
+    // multiallelic sites. That is tolerable for this debug TSV but
+    // must become deterministic before VCF emission — switch to a
+    // sort by `(kind, position, ref_seq, alt_seq)` at that point.
+    let mut variant_counts: HashMap<Allele, u32> = HashMap::new();
+    let mut total: u32 = 0;
+    for obs in observations {
+        total += 1;
+        if obs.allele.kind != AlleleKind::Reference {
+            *variant_counts.entry(obs.allele.clone()).or_insert(0) += 1;
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+
+    // Apply min-alt-count / min-alt-fraction thresholds. At least one
+    // candidate must survive for the site to enter the caller.
+    let total_f = total as f64;
+    let candidates: Vec<Allele> = variant_counts
+        .into_iter()
+        .filter(|(_, c)| {
+            *c >= cli.min_alternate_count && (*c as f64) / total_f >= cli.min_alternate_fraction
+        })
+        .map(|(a, _)| a)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Candidate allele set = reference + surviving variants.
+    let mut alleles: Vec<Allele> = Vec::with_capacity(candidates.len() + 1);
+    alleles.push(Allele::reference(pos, vec![ref_base]));
+    alleles.extend(candidates);
+
+    let gts = enumerate_genotypes(&alleles, cli.ploidy);
+    if gts.is_empty() {
+        return None;
+    }
+    let call = call_genotype(&gts, observations, params);
+    let best = gts[call.best_index].clone();
+    Some(SiteCall {
+        tid,
+        pos,
+        ref_base,
+        depth: total,
+        best_genotype: best,
+        genotype_quality: call.genotype_quality,
+        log_posterior: call.log_posteriors[call.best_index],
+        alt_alleles: alleles
+            .into_iter()
+            .skip(1) // reference
+            .collect(),
+    })
+}
+
+struct SiteCall {
+    tid: i32,
+    pos: i64,
+    ref_base: u8,
+    depth: u32,
+    best_genotype: fb_genotype::Genotype,
+    genotype_quality: f64,
+    log_posterior: f64,
+    alt_alleles: Vec<Allele>,
+}
+
+fn run_call(cli: &Cli) -> Result<()> {
+    let fasta = open_fasta(&cli.fasta)
+        .with_context(|| format!("failed to open reference FASTA {:?}", cli.fasta))?;
+    let mut bam_reader = bam::Reader::from_path(&cli.bam)
+        .with_context(|| format!("failed to open BAM {:?}", cli.bam))?;
+    let contigs = read_bam_contigs(&cli.bam)?;
+    let target_names: Vec<String> = contigs.iter().map(|c| c.name.clone()).collect();
+    let target_lens: Vec<u64> = contigs.iter().map(|c| c.length).collect();
+
+    info!(
+        n_contigs = contigs.len(),
+        ploidy = cli.ploidy,
+        min_alt_count = cli.min_alternate_count,
+        min_alt_fraction = cli.min_alternate_fraction,
+        "running Bayesian caller (M3 Phase C-2)"
+    );
+
+    let filter = ReadFilter::default();
+    let params = Parameters {
+        ploidy: cli.ploidy,
+        ..Parameters::default()
+    };
+
+    let mut current_tid: i32 = -1;
+    let mut current_ref: Vec<u8> = Vec::new();
+    let mut pileup = Pileup::default();
+    let mut n_reads: u64 = 0;
+    let mut n_filtered: u64 = 0;
+
+    let mut record = bam::Record::new();
+    while let Some(result) = bam_reader.read(&mut record) {
+        result.context("BAM record read failed")?;
+        if record.tid() < 0 {
+            continue;
+        }
+        let tid = record.tid();
+        if tid != current_tid {
+            current_ref = fetch_contig(&fasta, &target_names, &target_lens, tid as usize)?;
+            current_tid = tid;
+            debug!(
+                contig = target_names[tid as usize].as_str(),
+                "fetched reference"
+            );
+        }
+        n_reads += 1;
+        let observations = match walk_record(&record, &current_ref, 0, &filter) {
+            Some(v) => v,
+            None => {
+                n_filtered += 1;
+                continue;
+            }
+        };
+        let observations = clump_observations(&observations, cli.haplotype_length);
+        pileup.add_read_observations(tid, observations);
+    }
+
+    info!(
+        n_reads = n_reads,
+        n_filtered = n_filtered,
+        n_positions = pileup.positions.len(),
+        "pileup complete"
+    );
+
+    // Re-fetch ref per tid as we iterate — same pattern as the dump
+    // path. Positions are in (tid, pos) order thanks to the BTreeMap.
+    let mut site_calls: Vec<SiteCall> = Vec::new();
+    let mut current_tid: i32 = -1;
+    let mut current_ref: Vec<u8> = Vec::new();
+    for ((tid, pos), observations) in pileup.positions.iter() {
+        if *tid != current_tid {
+            current_ref = fetch_contig(&fasta, &target_names, &target_lens, *tid as usize)?;
+            current_tid = *tid;
+        }
+        let ref_base = match current_ref.get(*pos as usize) {
+            Some(&b) => b,
+            None => continue, // out-of-bounds (shouldn't happen post-walker)
+        };
+        if let Some(call) = call_site(*tid, *pos, observations, ref_base, cli, &params) {
+            site_calls.push(call);
+        }
+    }
+
+    info!(n_calls = site_calls.len(), "calling complete");
+    emit_call_tsv(cli.output.as_deref(), &target_names, &site_calls)?;
+    Ok(())
+}
+
+fn emit_call_tsv(output: Option<&Path>, target_names: &[String], calls: &[SiteCall]) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    writeln!(buf, "chrom\tpos\tref\talt\tgenotype\tgq\tdp\tlog_posterior")?;
+    for call in calls {
+        let chrom = target_names
+            .get(call.tid as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let ref_bytes = [call.ref_base];
+        let ref_display = std::str::from_utf8(&ref_bytes).unwrap_or("?");
+        let alt_display = if call.alt_alleles.is_empty() {
+            ".".to_string()
+        } else {
+            call.alt_alleles
+                .iter()
+                .map(|a| {
+                    if a.alt_seq.is_empty() {
+                        ".".to_string()
+                    } else {
+                        String::from_utf8_lossy(&a.alt_seq).into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        writeln!(
+            buf,
+            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{:.4}",
+            chrom,
+            call.pos + 1, // 1-based display
+            ref_display,
+            alt_display,
+            call.best_genotype.str_tag(),
+            call.genotype_quality,
+            call.depth,
+            call.log_posterior,
+        )?;
+    }
+    write_output(output, &buf)
 }
 
 fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {

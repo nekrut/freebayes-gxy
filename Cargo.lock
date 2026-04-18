@@ -323,6 +323,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fb-core",
+ "fb-genotype",
  "fb-vcf",
  "rust-htslib",
  "tempfile",
