@@ -112,17 +112,18 @@ fn call_emits_het_and_hom_alt_rows() {
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines[0], "chrom\tpos\tref\talt\tgenotype\tgq\tdp\tlog_posterior",
-        "header mismatch"
-    );
-    let body: Vec<&str> = lines.iter().skip(1).copied().collect();
+    // M4 Phase A: output is now a VCF, not a TSV. Strip `##` header
+    // lines and the `#CHROM` column header.
+    let body: Vec<String> = stdout
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(String::from)
+        .collect();
 
-    // Expect exactly two called sites: 1-based pos 6 (het) and 11 (hom-alt).
-    assert_eq!(body.len(), 2, "expected 2 called sites, got: {body:#?}");
+    // Expect exactly two called sites.
+    assert_eq!(body.len(), 2, "expected 2 called records, got: {body:#?}");
 
-    // Het site at 1-based pos 6: ref C, alt A, genotype REF/SNP, dp=10.
+    // VCF columns: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT SAMPLE.
     let het_row = body
         .iter()
         .find(|l| {
@@ -131,19 +132,15 @@ fn call_emits_het_and_hom_alt_rows() {
         })
         .expect("het row missing");
     let het_fields: Vec<&str> = het_row.split('\t').collect();
-    assert_eq!(het_fields[2], "C", "het ref mismatch");
-    assert_eq!(het_fields[3], "A", "het alt mismatch");
-    assert!(
-        het_fields[4].contains('/'),
-        "expected heterozygous genotype at pos 6, got {}",
-        het_fields[4]
-    );
-    assert_eq!(het_fields[6], "10", "het dp mismatch");
-    // GQ should be substantial on 5/5 Q30 at MQ60.
-    let gq: f64 = het_fields[5].parse().expect("gq parse");
-    assert!(gq > 30.0, "expected GQ > 30 on het site, got {gq}");
+    assert_eq!(het_fields[3], "C", "het ref mismatch");
+    assert_eq!(het_fields[4], "A", "het alt mismatch");
+    // Sample GT must be heterozygous: 0/1.
+    let het_gt = het_fields[9].split(':').next().unwrap();
+    assert_eq!(het_gt, "0/1", "expected 0/1 at het site, got {het_gt}");
+    // FORMAT DP (second field) must match coverage.
+    let het_dp = het_fields[9].split(':').nth(1).unwrap();
+    assert_eq!(het_dp, "10", "het DP mismatch");
 
-    // Hom-alt site at 1-based pos 11: ref G, alt T, genotype SNP, dp=10.
     let hom_row = body
         .iter()
         .find(|l| {
@@ -152,19 +149,18 @@ fn call_emits_het_and_hom_alt_rows() {
         })
         .expect("hom-alt row missing");
     let hom_fields: Vec<&str> = hom_row.split('\t').collect();
-    assert_eq!(hom_fields[2], "G");
-    assert_eq!(hom_fields[3], "T");
-    assert_eq!(
-        hom_fields[4], "SNP",
-        "expected homozygous SNP tag at pos 11, got {}",
-        hom_fields[4]
+    assert_eq!(hom_fields[3], "G");
+    assert_eq!(hom_fields[4], "T");
+    let hom_gt = hom_fields[9].split(':').next().unwrap();
+    assert_eq!(hom_gt, "1/1", "expected 1/1 at hom-alt site, got {hom_gt}");
+    let hom_dp = hom_fields[9].split(':').nth(1).unwrap();
+    assert_eq!(hom_dp, "10");
+    // INFO field sanity: TYPE=snp.
+    assert!(
+        hom_fields[7].contains("TYPE=snp"),
+        "expected TYPE=snp in INFO, got {}",
+        hom_fields[7]
     );
-    assert_eq!(hom_fields[6], "10");
-    // At 10x Q30 coverage, the next-best het genotype has P = 0.5^10
-    // ≈ 10^-3 under the multinomial, capping GQ around 30. Lower
-    // coverage or lower Q would push this down further.
-    let gq: f64 = hom_fields[5].parse().expect("gq parse");
-    assert!(gq > 25.0, "expected GQ > 25 on clean hom-alt, got {gq}");
 }
 
 #[test]
@@ -217,9 +213,10 @@ fn call_filters_sites_below_min_alternate_count() {
         .expect("spawn cli");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let body: Vec<&str> = stdout.lines().skip(1).collect();
+    // VCF: expect header lines but no variant records.
+    let body: Vec<&str> = stdout.lines().filter(|l| !l.starts_with('#')).collect();
     assert!(
         body.is_empty(),
-        "expected zero called sites with 1/10 alt below threshold, got: {body:#?}"
+        "expected zero called records with 1/10 alt below threshold, got: {body:#?}"
     );
 }

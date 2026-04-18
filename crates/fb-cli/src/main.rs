@@ -2,8 +2,9 @@
 //!
 //! Modes:
 //! - `--dump-alleles` (M1+M2): per-allele TSV summary.
-//! - `--call` (M3 Phase C-2): per-position pileup + Bayesian single-
-//!   sample genotype call, TSV output with GQ.
+//! - `--call` (M3 + M4 Phase A): per-position pileup + Bayesian single-
+//!   sample genotype call, freebayes-compatible VCF output with proper
+//!   anchor-base synthesis for indels.
 //! - default: emits the M0 VCF header only.
 
 use std::collections::{BTreeMap, HashMap};
@@ -17,7 +18,7 @@ use fb_core::{
     clump_observations, walk_record, Allele, AlleleKind, AlleleObservation, ReadFilter, Strand,
 };
 use fb_genotype::{call_genotype, enumerate_genotypes, Parameters};
-use fb_vcf::{build_header, Contig};
+use fb_vcf::{build_header, synthesize_anchored, write_record, Contig, Record, RecordKind};
 use rust_htslib::bam::{self, Read as _};
 use rust_htslib::faidx;
 use tracing::{debug, info, warn};
@@ -393,7 +394,8 @@ impl Pileup {
 
 /// Given a position's observation bucket, assemble the candidate
 /// allele set (reference + distinct variants meeting the min-count /
-/// min-fraction thresholds) and run the Bayesian caller.
+/// min-fraction thresholds), run the Bayesian caller, and package the
+/// VCF-ready fields.
 fn call_site(
     tid: i32,
     pos: i64,
@@ -403,18 +405,14 @@ fn call_site(
     params: &Parameters,
 ) -> Option<SiteCall> {
     // Collect candidate variant alleles with their observation counts.
-    // `Allele` implements `Hash` + `Eq` (but not `Ord`), so use a HashMap.
-    //
-    // NOTE(M4): HashMap iteration order is non-deterministic, so the
-    // ordering of ALT alleles in the TSV can differ between runs at
-    // multiallelic sites. That is tolerable for this debug TSV but
-    // must become deterministic before VCF emission — switch to a
-    // sort by `(kind, position, ref_seq, alt_seq)` at that point.
     let mut variant_counts: HashMap<Allele, u32> = HashMap::new();
     let mut total: u32 = 0;
+    let mut ref_obs: u32 = 0;
     for obs in observations {
         total += 1;
-        if obs.allele.kind != AlleleKind::Reference {
+        if obs.allele.kind == AlleleKind::Reference {
+            ref_obs += 1;
+        } else {
             *variant_counts.entry(obs.allele.clone()).or_insert(0) += 1;
         }
     }
@@ -422,43 +420,96 @@ fn call_site(
         return None;
     }
 
-    // Apply min-alt-count / min-alt-fraction thresholds. At least one
-    // candidate must survive for the site to enter the caller.
+    // Apply min-alt-count / min-alt-fraction thresholds and sort
+    // candidates deterministically so ALT ordering is stable across
+    // runs (required for VCF parity).
     let total_f = total as f64;
-    let candidates: Vec<Allele> = variant_counts
+    let mut surviving: Vec<(Allele, u32)> = variant_counts
         .into_iter()
         .filter(|(_, c)| {
             *c >= cli.min_alternate_count && (*c as f64) / total_f >= cli.min_alternate_fraction
         })
-        .map(|(a, _)| a)
         .collect();
-    if candidates.is_empty() {
+    if surviving.is_empty() {
         return None;
     }
+    surviving.sort_by(|(a, _), (b, _)| {
+        a.position
+            .cmp(&b.position)
+            .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+            .then_with(|| a.ref_seq.cmp(&b.ref_seq))
+            .then_with(|| a.alt_seq.cmp(&b.alt_seq))
+    });
 
-    // Candidate allele set = reference + surviving variants.
-    let mut alleles: Vec<Allele> = Vec::with_capacity(candidates.len() + 1);
+    // Candidate allele set = reference + surviving variants (in canonical order).
+    let mut alleles: Vec<Allele> = Vec::with_capacity(surviving.len() + 1);
     alleles.push(Allele::reference(pos, vec![ref_base]));
-    alleles.extend(candidates);
+    let alt_obs: Vec<u32> = surviving.iter().map(|(_, c)| *c).collect();
+    alleles.extend(surviving.into_iter().map(|(a, _)| a));
 
     let gts = enumerate_genotypes(&alleles, cli.ploidy);
     if gts.is_empty() {
         return None;
     }
     let call = call_genotype(&gts, observations, params);
-    let best = gts[call.best_index].clone();
+
+    // VCF-style GT indices: walk the MAP genotype's elements and map
+    // each to its index in `alleles` (0 = REF, 1..N = alts in the
+    // sorted order above).
+    let best = &gts[call.best_index];
+    let mut gt_indices: Vec<u8> = Vec::with_capacity(best.ploidy as usize);
+    for elem in &best.elements {
+        let idx = alleles
+            .iter()
+            .position(|a| a == &elem.allele)
+            .expect("best genotype's element must be in the candidate set") as u8;
+        for _ in 0..elem.count {
+            gt_indices.push(idx);
+        }
+    }
+    gt_indices.sort(); // canonical GT order (e.g. 0/1 not 1/0).
+
+    // Site-level variant quality: P(site is NOT variant) is the
+    // hom-reference genotype's posterior. QUAL is its Phred-scaled
+    // complement: -10 * log10(P(hom-ref)), clamped at MAX_GQ.
+    let hom_ref_idx = gts
+        .iter()
+        .position(|g| g.homozygous && g.elements[0].allele == alleles[0]);
+    let qual = hom_ref_idx.map(|i| {
+        let log_p = call.log_posteriors[i];
+        if log_p == f64::NEG_INFINITY {
+            fb_genotype::MAX_GQ
+        } else {
+            (-10.0 * log_p / std::f64::consts::LN_10).clamp(0.0, fb_genotype::MAX_GQ)
+        }
+    });
+
+    let alt_kinds: Vec<RecordKind> = alleles
+        .iter()
+        .skip(1)
+        .map(|a| match a.kind {
+            AlleleKind::Snp => RecordKind::Snp,
+            AlleleKind::Mnp => RecordKind::Mnp,
+            AlleleKind::Insertion => RecordKind::Ins,
+            AlleleKind::Deletion => RecordKind::Del,
+            AlleleKind::Complex => RecordKind::Complex,
+            // REF/Null shouldn't appear in the alt set.
+            _ => RecordKind::Snp,
+        })
+        .collect();
+
     Some(SiteCall {
         tid,
         pos,
         ref_base,
         depth: total,
-        best_genotype: best,
+        ref_obs,
+        alt_obs,
+        gt_indices,
         genotype_quality: call.genotype_quality,
-        log_posterior: call.log_posteriors[call.best_index],
-        alt_alleles: alleles
-            .into_iter()
-            .skip(1) // reference
-            .collect(),
+        qual,
+        alt_alleles: alleles.into_iter().skip(1).collect(),
+        alt_kinds,
     })
 }
 
@@ -467,10 +518,13 @@ struct SiteCall {
     pos: i64,
     ref_base: u8,
     depth: u32,
-    best_genotype: fb_genotype::Genotype,
+    ref_obs: u32,
+    alt_obs: Vec<u32>,
+    gt_indices: Vec<u8>,
     genotype_quality: f64,
-    log_posterior: f64,
+    qual: Option<f64>,
     alt_alleles: Vec<Allele>,
+    alt_kinds: Vec<RecordKind>,
 }
 
 fn run_call(cli: &Cli) -> Result<()> {
@@ -556,49 +610,93 @@ fn run_call(cli: &Cli) -> Result<()> {
     }
 
     info!(n_calls = site_calls.len(), "calling complete");
-    emit_call_tsv(cli.output.as_deref(), &target_names, &site_calls)?;
+    emit_call_vcf(
+        cli,
+        &fasta,
+        &target_names,
+        &target_lens,
+        &contigs,
+        &site_calls,
+    )?;
     Ok(())
 }
 
-fn emit_call_tsv(output: Option<&Path>, target_names: &[String], calls: &[SiteCall]) -> Result<()> {
+/// Emit a freebayes-compatible VCF from the per-site calls. For
+/// indel records, we look up the anchor base (at `position - 1`) from
+/// the reference FASTA to synthesise the upstream VCF shape.
+fn emit_call_vcf(
+    cli: &Cli,
+    fasta: &faidx::Reader,
+    target_names: &[String],
+    target_lens: &[u64],
+    contigs: &[Contig],
+    calls: &[SiteCall],
+) -> Result<()> {
+    let reference = cli.fasta.to_string_lossy().into_owned();
     let mut buf: Vec<u8> = Vec::new();
-    writeln!(buf, "chrom\tpos\tref\talt\tgenotype\tgq\tdp\tlog_posterior")?;
+    buf.extend_from_slice(build_header(&reference, contigs, &cli.sample).as_bytes());
+
+    // Fetch the reference lazily per tid for anchor-base lookups.
+    let mut current_tid: i32 = -1;
+    let mut current_ref: Vec<u8> = Vec::new();
+
     for call in calls {
+        if call.tid != current_tid {
+            current_ref = fetch_contig(fasta, target_names, target_lens, call.tid as usize)?;
+            current_tid = call.tid;
+        }
         let chrom = target_names
             .get(call.tid as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("?");
-        let ref_bytes = [call.ref_base];
-        let ref_display = std::str::from_utf8(&ref_bytes).unwrap_or("?");
-        let alt_display = if call.alt_alleles.is_empty() {
-            ".".to_string()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        // For each alt, synthesise the VCF-anchored (pos, ref, alt) tuple.
+        // Multi-alt sites pick the first alt to define the anchor layout;
+        // multiallelic INS/DEL mixing is an M4-B scenario. For Phase A
+        // each call has 1 alt so the "first alt" always agrees with
+        // the single alt present.
+        let first_kind = call.alt_kinds.first().copied().unwrap_or(RecordKind::Snp);
+        let first_alt = call
+            .alt_alleles
+            .first()
+            .expect("call_site guarantees ≥1 alt");
+
+        // Anchor base: the ref byte at (0-based) pos - 1, needed for
+        // INS / DEL synthesis. SNPs ignore it.
+        let anchor_idx = call.pos - 1;
+        let anchor_base = if anchor_idx >= 0 && (anchor_idx as usize) < current_ref.len() {
+            Some(current_ref[anchor_idx as usize])
         } else {
-            call.alt_alleles
-                .iter()
-                .map(|a| {
-                    if a.alt_seq.is_empty() {
-                        ".".to_string()
-                    } else {
-                        String::from_utf8_lossy(&a.alt_seq).into_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(",")
+            None
         };
-        writeln!(
-            buf,
-            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{:.4}",
+
+        let (vcf_pos, vcf_ref, vcf_alt) = synthesize_anchored(
+            first_kind,
+            call.pos,
+            &first_alt.ref_seq,
+            &first_alt.alt_seq,
+            anchor_base,
+        );
+
+        let record = Record {
             chrom,
-            call.pos + 1, // 1-based display
-            ref_display,
-            alt_display,
-            call.best_genotype.str_tag(),
-            call.genotype_quality,
-            call.depth,
-            call.log_posterior,
-        )?;
+            pos: vcf_pos,
+            ref_seq: vcf_ref,
+            alts: vec![vcf_alt],
+            qual: call.qual,
+            depth: call.depth,
+            ref_obs: call.ref_obs,
+            alt_obs: call.alt_obs.clone(),
+            gt_indices: call.gt_indices.clone(),
+            gq: call.genotype_quality,
+            alt_kinds: call.alt_kinds.clone(),
+        };
+        buf.extend_from_slice(write_record(&record).as_bytes());
+
+        // Explicitly drop unused bindings to keep lint clean.
+        let _ = &call.ref_base;
     }
-    write_output(output, &buf)
+    write_output(cli.output.as_deref(), &buf)
 }
 
 fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {

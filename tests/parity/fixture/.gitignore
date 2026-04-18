@@ -6,10 +6,16 @@ sample.bam.bai
 truth.tsv
 upstream.vcf
 upstream.log
+upstream.norm.log
+upstream.norm.tsv
 upstream.normalized.tsv
 upstream.sorted.tsv
 gxy.tsv
 gxy.log
+gxy.norm.log
+gxy.norm.tsv
 gxy.normalized.tsv
 gxy.sorted.tsv
+gxy.vcf
 diff.txt
+site.diff.txt
