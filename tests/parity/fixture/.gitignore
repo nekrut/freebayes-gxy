@@ -17,5 +17,7 @@ gxy.norm.tsv
 gxy.normalized.tsv
 gxy.sorted.tsv
 gxy.vcf
+gxy.vcf.gz
+gxy.vcf.gz.tbi
 diff.txt
 site.diff.txt
