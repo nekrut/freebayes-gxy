@@ -38,8 +38,8 @@ done
 UPSTREAM_VCF="$DIR/upstream.vcf"
 GXY_VCF="$DIR/gxy.vcf"
 
-echo "==> running upstream..."
-"$UPSTREAM" -f "$FA" "$BAM" > "$UPSTREAM_VCF" 2> "$DIR/upstream.log"
+echo "==> running upstream (--legacy-gls for apples-to-apples standardGLs comparison)..."
+"$UPSTREAM" --legacy-gls -f "$FA" "$BAM" > "$UPSTREAM_VCF" 2> "$DIR/upstream.log"
 echo "==> running gxy..."
 "$GXY" --call -f "$FA" "$BAM" > "$GXY_VCF" 2> "$DIR/gxy.log"
 
