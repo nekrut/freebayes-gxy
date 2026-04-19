@@ -38,29 +38,45 @@ OUT_DIR = Path(__file__).resolve().parent
 
 def generate_truth():
     """Seed a deterministic set of truth variants. Each tuple is
-    (0-based pos, kind, ref_bases, alt_bases, zygosity)."""
+    (0-based pos, kind, ref_bases, alt_bases, zygosity).
+
+    Position-disjoint: SNPs, INS, and DEL sit on distinct residue
+    classes mod 50 so no two truth events collide at the same ref
+    position. Previously the three step progressions aliased at a few
+    common multiples, producing multi-allelic truth sites that caller
+    min-alt-count / min-alt-fraction thresholds would drop on both
+    sides — manifesting as a shared FN block in the parity report."""
     truths = []
-    # ~60 SNPs spaced every 150 bp (pos 100, 250, 400, ...).
+
+    # SNPs at 0-based positions ≡ 0 (mod 50) in [100, REF_LEN - 200).
+    # Spacing 150 bp.
     for i, pos in enumerate(range(100, REF_LEN - 200, 150)):
-        # Half het, half hom; vary bases.
         zyg = "het" if i % 2 == 0 else "hom"
         ref = ["A", "C", "G", "T"][i % 4]
         alt = ["T", "G", "A", "C"][i % 4]
         truths.append((pos, "snp", ref, alt, zyg))
 
-    # ~20 INS spaced at 200bp offsets from pos 150
-    for i, pos in enumerate(range(150, REF_LEN - 300, 400)):
+    # INS at 0-based positions ≡ 20 (mod 50) in [120, REF_LEN - 300).
+    # Spacing 400 bp. 120, 520, 920, ... disjoint from SNP residue 0.
+    for i, pos in enumerate(range(120, REF_LEN - 300, 400)):
         zyg = "het" if i % 2 == 0 else "hom"
         ins_len = 1 + (i % 3)  # 1, 2, or 3 bp insertions
         ins_seq = "".join(random.choices("ACGT", k=ins_len))
         truths.append((pos, "ins", "", ins_seq, zyg))
 
-    # ~20 DEL spaced at 200bp offsets from pos 200
-    for i, pos in enumerate(range(200, REF_LEN - 300, 400)):
+    # DEL at 0-based positions ≡ 35 (mod 50) in [135, REF_LEN - 300).
+    # Spacing 400 bp. Also disjoint from SNP and INS residues.
+    for i, pos in enumerate(range(135, REF_LEN - 300, 400)):
         zyg = "hom" if i % 2 == 0 else "het"
-        del_len = 1 + (i % 3)
         truths.append((pos, "del", "", "", zyg))  # ref bases filled in later
-        # We'll resolve the deleted ref bases once the reference is built.
+
+    # MNPs deliberately excluded. When encoded as adjacent-SNP pairs
+    # in truth, both callers emit a single MNP record (via the M2
+    # clumping pass) that `bcftools isec` marks as an FP because the
+    # truth VCF has 2 separate SNPs at those positions. That's a
+    # truth-representation mismatch, not a caller issue; a proper
+    # MNP probe needs truth emitted as multi-base records too. The
+    # M2 clumping path is exercised by fb-core's haplotype unit tests.
 
     return truths
 
