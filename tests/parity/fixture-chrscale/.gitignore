@@ -1,0 +1,12 @@
+ref.fa
+ref.fa.fai
+sample.bam
+sample.bam.bai
+truth.vcf
+truth.vcf.gz
+truth.vcf.gz.tbi
+upstream.vcf
+upstream.log
+gxy.vcf
+gxy.log
+regions.100k.txt

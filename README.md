@@ -3,12 +3,19 @@
 [![CI](https://github.com/nekrut/freebayes-gxy/actions/workflows/ci.yml/badge.svg)](https://github.com/nekrut/freebayes-gxy/actions/workflows/ci.yml)
 
 A from-scratch Rust rewrite of [freebayes](https://github.com/freebayes/freebayes),
-targeting byte-level VCF parity with upstream **v1.3.10** while delivering
-native multithreading, modern I/O, and a clean embeddable library API for
-Galaxy and nf-core pipelines.
+targeting byte-level VCF parity with upstream **v1.3.10** (with
+`--legacy-gls`) while delivering native multithreading, modern I/O, and a
+clean embeddable library API for Galaxy and nf-core pipelines.
 
-See [`PLAN.md`](PLAN.md) for the full design, milestone breakdown, and parity
-targets. **Status: M0 scaffolding — no variant calling yet.**
+**Status (2026-04-19):** single-sample calling is end-to-end functional.
+F1 = 1.0000 vs synthetic truth on 2 kb / 10 kb / 100 kb / 1 Mb fixtures;
+GL values byte-identical to upstream `--legacy-gls`; 4.7–7.9× faster
+single-threaded than upstream serial (data: M5-E / M5-F). 129/129 tests
+pass; `clippy` / `fmt` / `cargo doc` clean.
+
+See [`docs/README.md`](docs/README.md) for the full project dossier
+(architecture, performance story, parity story, roadmap) and
+[`PLAN.md`](PLAN.md) for the original design.
 
 ## Crates
 
@@ -29,8 +36,9 @@ cargo build --workspace
 # CLI help
 cargo run -- --help
 
-# Emit a placeholder VCF header for an indexed BAM
-cargo run -- -f reference.fa input.bam
+# Call single-sample variants
+./target/release/freebayes-gxy --call --threads 8 \
+    -f reference.fa sample.bam > out.vcf
 ```
 
 System requirements: stable Rust (MSRV **1.80**), a C toolchain, and the
