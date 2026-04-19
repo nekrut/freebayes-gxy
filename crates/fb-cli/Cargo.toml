@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+rayon.workspace = true
 rust-htslib.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -22,6 +23,7 @@ tracing-subscriber.workspace = true
 
 fb-core = { path = "../fb-core" }
 fb-genotype = { path = "../fb-genotype" }
+fb-scheduler = { path = "../fb-scheduler" }
 fb-vcf = { path = "../fb-vcf" }
 
 [dev-dependencies]

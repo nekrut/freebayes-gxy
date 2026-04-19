@@ -85,6 +85,26 @@ struct Cli {
     )]
     haplotype_length: i64,
 
+    /// Number of worker threads for the per-site caller (M5 Phase A).
+    /// `1` (default) uses the original single-threaded path. Higher
+    /// values shard the BAM into genomic tiles (size controlled by
+    /// `--tile-size`) and run the pileup + call loop in parallel via
+    /// Rayon. Output is re-sorted so the VCF is identical across
+    /// thread counts.
+    #[arg(short = 't', long = "threads", default_value_t = 1, value_name = "N")]
+    threads: usize,
+
+    /// Tile size (bp) for the M5 parallel scheduler. The BAM is split
+    /// into non-overlapping windows of this size along each contig;
+    /// each window is processed by one worker. Smaller values
+    /// increase parallelism at the cost of per-tile overhead; larger
+    /// values reduce overhead but limit concurrency on short contigs.
+    /// Default 100 kb matches upstream `freebayes-parallel`
+    /// recommendations for ~30× WGS. Only consulted when
+    /// `--threads > 1`.
+    #[arg(long = "tile-size", default_value_t = 100_000, value_name = "BP")]
+    tile_size: u64,
+
     /// Input BAM file (positional, matches upstream freebayes).
     #[arg(value_name = "BAM")]
     bam: PathBuf,
@@ -698,7 +718,159 @@ struct SiteCall {
     genotype_log10_likelihoods: Option<Vec<f64>>,
 }
 
+/// M5 Phase A parallel caller — tile the BAM into genomic windows and
+/// dispatch each to a Rayon worker. Each worker opens its own
+/// `IndexedReader` + FASTA `faidx::Reader`, builds a local
+/// [`Pileup`] from reads fetched via the BAM index at its window, and
+/// runs `call_site` over every position inside the window. Output
+/// `SiteCall`s are merged and sorted by `(tid, pos)` so the resulting
+/// VCF is byte-identical to the single-threaded path.
+///
+/// Requires `sample.bam.bai`; fails loudly if absent.
+fn run_call_parallel(cli: &Cli) -> Result<()> {
+    use rayon::prelude::*;
+
+    let contigs = read_bam_contigs(&cli.bam)?;
+    let target_names: Vec<String> = contigs.iter().map(|c| c.name.clone()).collect();
+    let target_lens: Vec<u64> = contigs.iter().map(|c| c.length).collect();
+
+    info!(
+        n_contigs = contigs.len(),
+        threads = cli.threads,
+        tile_size = cli.tile_size,
+        "running Bayesian caller (M5 parallel)"
+    );
+
+    // Tile every contig into fixed-size windows. Each tile carries the
+    // contig tid so workers can skip another lookup.
+    let tiles: Vec<(i32, fb_scheduler::Window)> = contigs
+        .iter()
+        .enumerate()
+        .flat_map(|(tid, c)| {
+            fb_scheduler::tile_contig(&c.name, c.length, cli.tile_size)
+                .into_iter()
+                .map(move |w| (tid as i32, w))
+        })
+        .collect();
+
+    // Configure the Rayon thread pool for this invocation.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(cli.threads)
+        .build()
+        .map_err(|e| anyhow!("failed to build rayon pool: {e}"))?;
+
+    let params = Parameters {
+        ploidy: cli.ploidy,
+        ..Parameters::default()
+    };
+    let filter = ReadFilter::default();
+
+    // Each worker produces its own Vec<SiteCall>; merge + sort after.
+    let results: Result<Vec<Vec<SiteCall>>> = pool.install(|| {
+        tiles
+            .par_iter()
+            .map(|(tid, window)| -> Result<Vec<SiteCall>> {
+                call_window(cli, &filter, &params, *tid, window, &target_lens)
+            })
+            .collect()
+    });
+    let mut site_calls: Vec<SiteCall> = results?.into_iter().flatten().collect();
+    site_calls.sort_by_key(|c| (c.tid, c.pos));
+
+    info!(
+        n_tiles = tiles.len(),
+        n_calls = site_calls.len(),
+        "parallel calling complete"
+    );
+
+    // Emit uses a single fresh FASTA reader (main thread) for anchor
+    // lookups. Per-tile fetches remain worker-local.
+    let fasta = open_fasta(&cli.fasta)
+        .with_context(|| format!("failed to open reference FASTA {:?}", cli.fasta))?;
+    emit_call_vcf(
+        cli,
+        &fasta,
+        &target_names,
+        &target_lens,
+        &contigs,
+        &site_calls,
+    )
+}
+
+/// Worker body — fetch reads overlapping `window`, run the walker +
+/// clumping + pileup, call every position in `[window.start,
+/// window.end)`. Reads whose alignment spans the window boundary are
+/// still admitted (we need their observations for positions inside
+/// the window), but any positions they might contribute OUTSIDE the
+/// window are suppressed at call-emission time via the window clamp.
+fn call_window(
+    cli: &Cli,
+    filter: &ReadFilter,
+    params: &Parameters,
+    tid: i32,
+    window: &fb_scheduler::Window,
+    target_lens: &[u64],
+) -> Result<Vec<SiteCall>> {
+    let fasta = open_fasta(&cli.fasta)
+        .with_context(|| format!("worker: failed to open FASTA {:?}", cli.fasta))?;
+    let mut bam = bam::IndexedReader::from_path(&cli.bam)
+        .with_context(|| format!("worker: failed to open BAM {:?} (index required)", cli.bam))?;
+    bam.fetch((tid, window.start as i64, window.end as i64))
+        .with_context(|| {
+            format!(
+                "worker: fetch failed for {}:{}-{}",
+                window.contig, window.start, window.end
+            )
+        })?;
+
+    let contig_len = *target_lens
+        .get(tid as usize)
+        .ok_or_else(|| anyhow!("worker: contig tid {tid} has no recorded length"))?;
+    // Fetch the full contig — anchor lookups reach back by one base at
+    // the window's left edge, so window-local fetches would need a
+    // 1 bp left pad. Fetching the contig is simpler and amortised
+    // across positions.
+    let ref_target = std::slice::from_ref(&window.contig);
+    let ref_target_lens = std::slice::from_ref(&contig_len);
+    let current_ref = fetch_contig(&fasta, ref_target, ref_target_lens, 0)?;
+
+    let mut pileup = Pileup::default();
+    let mut record = bam::Record::new();
+    while let Some(result) = bam.read(&mut record) {
+        result.context("worker: BAM record read failed")?;
+        if record.tid() != tid {
+            continue;
+        }
+        let observations = match walk_record(&record, &current_ref, 0, filter) {
+            Some(v) => v,
+            None => continue,
+        };
+        let observations = clump_observations(&observations, cli.haplotype_length);
+        pileup.add_read_observations(tid, observations);
+    }
+
+    // Call only positions strictly inside the window so neighbouring
+    // workers don't double-emit at tile boundaries.
+    let mut calls: Vec<SiteCall> = Vec::new();
+    for ((tid_p, pos), observations) in pileup.positions.iter() {
+        let pos_u = *pos as u64;
+        if *tid_p != tid || pos_u < window.start || pos_u >= window.end {
+            continue;
+        }
+        let Some(&ref_base) = current_ref.get(*pos as usize) else {
+            continue;
+        };
+        if let Some(call) = call_site(*tid_p, *pos, observations, ref_base, cli, params) {
+            calls.push(call);
+        }
+    }
+    Ok(calls)
+}
+
 fn run_call(cli: &Cli) -> Result<()> {
+    if cli.threads > 1 {
+        return run_call_parallel(cli);
+    }
     let fasta = open_fasta(&cli.fasta)
         .with_context(|| format!("failed to open reference FASTA {:?}", cli.fasta))?;
     let mut bam_reader = bam::Reader::from_path(&cli.bam)
