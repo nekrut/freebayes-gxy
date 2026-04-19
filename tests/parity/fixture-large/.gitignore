@@ -23,3 +23,5 @@ gxy.log
 gxy.norm.vcf.gz
 gxy.norm.vcf.gz.tbi
 gxy.norm.log
+g_indel.txt
+t_indel.txt

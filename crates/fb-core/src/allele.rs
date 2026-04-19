@@ -232,6 +232,13 @@ pub struct AlleleObservation {
     /// `AlleleParser.cpp:1691` — `rp` before the deletion consumes it).
     pub read_position: usize,
     pub is_proper_pair: bool,
+    /// 0-based reference position where the source read's alignment
+    /// begins (i.e. `BAM_POS`). Used by the per-site caller to filter
+    /// REF observations at indel sites by whether the read spans the
+    /// variant's anchor — a read that starts at or after the indel
+    /// position can't distinguish REF from INS/DEL because it doesn't
+    /// see the anchor base at `pos - 1`.
+    pub read_ref_start: i64,
 }
 
 #[cfg(test)]

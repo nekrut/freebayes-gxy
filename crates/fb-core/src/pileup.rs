@@ -235,6 +235,7 @@ pub fn walk_alignment(
                             strand,
                             read_position: rp,
                             is_proper_pair,
+                            read_ref_start: read.pos,
                         });
                     }
                 }
@@ -274,6 +275,7 @@ pub fn walk_alignment(
                             strand,
                             read_position: rp,
                             is_proper_pair,
+                            read_ref_start: read.pos,
                         });
                     }
                 }
@@ -363,6 +365,7 @@ fn walk_match_run(
                     strand,
                     read_position: start_rp,
                     is_proper_pair,
+                    read_ref_start: read.pos,
                 });
             }
         };
@@ -403,6 +406,7 @@ fn walk_match_run(
                     strand,
                     read_position: *rp,
                     is_proper_pair,
+                    read_ref_start: read.pos,
                 });
             } else {
                 // Non-ATGC read base (typically 'N'). Upstream emits an
@@ -416,6 +420,7 @@ fn walk_match_run(
                     strand,
                     read_position: *rp,
                     is_proper_pair,
+                    read_ref_start: read.pos,
                 });
             }
         }

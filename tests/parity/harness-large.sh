@@ -46,7 +46,13 @@ echo "==> running gxy..."
 echo "==> normalising..."
 for tag in upstream gxy truth; do
     src="$DIR/${tag}.vcf"
-    [[ -f "$src.gz" ]] || { bgzip -kf "$src"; }
+    # Always re-bgzip so stale .gz files don't silently shadow a fresh
+    # re-run of the caller. bgzip -k keeps the uncompressed source.
+    # truth.vcf.gz is the primary — regenerate only if the .vcf source
+    # exists, else trust the existing .gz.
+    if [[ -f "$src" ]]; then
+        bgzip -kf "$src"
+    fi
     tabix -p vcf -f "$src.gz"
     bcftools norm -f "$FA" -Oz "$src.gz" -o "$DIR/${tag}.norm.vcf.gz" 2> "$DIR/${tag}.norm.log"
     tabix -p vcf -f "$DIR/${tag}.norm.vcf.gz"

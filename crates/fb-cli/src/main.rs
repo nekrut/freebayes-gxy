@@ -376,6 +376,10 @@ impl Pileup {
                             strand: obs.strand,
                             read_position: obs.read_position + offset,
                             is_proper_pair: obs.is_proper_pair,
+                            // Preserve the parent read's alignment start so
+                            // call_site can filter REF observations at indel
+                            // sites (drift 2 fix).
+                            read_ref_start: obs.read_ref_start,
                         };
                         self.positions.entry((tid, pos)).or_default().push(per_pos);
                     }
@@ -410,12 +414,9 @@ fn call_site(
     // Collect candidate variant alleles with their observation counts.
     let mut variant_counts: HashMap<Allele, u32> = HashMap::new();
     let mut total: u32 = 0;
-    let mut ref_obs: u32 = 0;
     for obs in observations {
         total += 1;
-        if obs.allele.kind == AlleleKind::Reference {
-            ref_obs += 1;
-        } else {
+        if obs.allele.kind != AlleleKind::Reference {
             *variant_counts.entry(obs.allele.clone()).or_insert(0) += 1;
         }
     }
@@ -447,14 +448,82 @@ fn call_site(
     // Candidate allele set = reference + surviving variants (in canonical order).
     let mut alleles: Vec<Allele> = Vec::with_capacity(surviving.len() + 1);
     alleles.push(Allele::reference(pos, vec![ref_base]));
-    let alt_obs: Vec<u32> = surviving.iter().map(|(_, c)| *c).collect();
     alleles.extend(surviving.into_iter().map(|(a, _)| a));
 
     let gts = enumerate_genotypes(&alleles, cli.ploidy);
     if gts.is_empty() {
         return None;
     }
-    let call = call_genotype(&gts, observations, params);
+
+    // Drift 2 fix (event-span admission). At a candidate site with any
+    // non-SNP allele, a REF observation is only informative if the
+    // source read spans the variant's anchor base (0-based `pos - 1`).
+    // Reads starting at `pos` or later have a match op at `pos` but do
+    // not see the anchor, so they can't distinguish REF from INS/DEL
+    // — upstream's event-span pileup excludes them. Replicate that
+    // here by filtering REF observations with `read_ref_start >= pos`
+    // whenever the candidate set contains an INS, DEL, or Complex.
+    let site_has_indel_candidate = alleles[1..].iter().any(|a| {
+        matches!(
+            a.kind,
+            AlleleKind::Insertion | AlleleKind::Deletion | AlleleKind::Complex
+        )
+    });
+    let filtered_observations: Vec<AlleleObservation>;
+    let effective_observations: &[AlleleObservation] = if site_has_indel_candidate {
+        // Step 1: drop REF observations from reads whose alignment does
+        // not span the anchor (read_ref_start >= pos).
+        let span_filtered: Vec<&AlleleObservation> = observations
+            .iter()
+            .filter(|o| o.allele.kind != AlleleKind::Reference || o.read_ref_start < pos)
+            .collect();
+        // Step 2: dedupe by read_name, preferring non-REF. Upstream
+        // treats a read's event (INS/DEL) as its single observation at
+        // the anchor — our walker can emit both the event AND a
+        // trailing REF at the same position when the read carries the
+        // indel, so without this step the same read double-counts
+        // toward both AO and RO.
+        use std::collections::HashMap as StdHashMap;
+        let mut per_read: StdHashMap<&str, &AlleleObservation> = StdHashMap::new();
+        for obs in span_filtered {
+            let key = obs.read_name.as_str();
+            let promote = match per_read.get(key) {
+                Some(existing) => {
+                    existing.allele.kind == AlleleKind::Reference
+                        && obs.allele.kind != AlleleKind::Reference
+                }
+                None => true,
+            };
+            if promote {
+                per_read.insert(key, obs);
+            }
+        }
+        filtered_observations = per_read.into_values().cloned().collect();
+        &filtered_observations
+    } else {
+        observations
+    };
+
+    // Recount DP / RO / AO from the event-span-filtered set so the
+    // VCF sample fields reflect what the caller scored. For SNP-only
+    // sites this is a no-op (filtered == observations).
+    let effective_total: u32 = effective_observations.len() as u32;
+    let effective_ref_obs: u32 = effective_observations
+        .iter()
+        .filter(|o| o.allele.kind == AlleleKind::Reference)
+        .count() as u32;
+    let alt_obs: Vec<u32> = alleles
+        .iter()
+        .skip(1)
+        .map(|a| {
+            effective_observations
+                .iter()
+                .filter(|o| &o.allele == a)
+                .count() as u32
+        })
+        .collect();
+
+    let call = call_genotype(&gts, effective_observations, params);
 
     // VCF-style GT indices: walk the MAP genotype's elements and map
     // each to its index in `alleles` (0 = REF, 1..N = alts in the
@@ -509,7 +578,7 @@ fn call_site(
     // here. Cheap at realistic coverage.
     let mut qual_ref: u32 = 0;
     let mut qual_alt: Vec<u32> = vec![0; alt_obs.len()];
-    for obs in observations {
+    for obs in effective_observations {
         if let Some(idx) = alleles.iter().position(|a| a == &obs.allele) {
             if idx == 0 {
                 qual_ref = qual_ref.saturating_add(obs.base_quality_sum);
@@ -582,8 +651,8 @@ fn call_site(
         tid,
         pos,
         ref_base,
-        depth: total,
-        ref_obs,
+        depth: effective_total,
+        ref_obs: effective_ref_obs,
         alt_obs,
         gt_indices,
         genotype_quality: call.genotype_quality,

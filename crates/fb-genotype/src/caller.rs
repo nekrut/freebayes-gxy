@@ -167,6 +167,7 @@ mod tests {
             strand: Strand::Forward,
             read_position: 0,
             is_proper_pair: true,
+            read_ref_start: 0,
         }
     }
 
