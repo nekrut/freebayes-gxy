@@ -892,8 +892,24 @@ fn run_call(cli: &Cli) -> Result<()> {
     let mut n_reads: u64 = 0;
     let mut n_filtered: u64 = 0;
 
+    // Optional fine-grained profiling of the pileup stage. Enable
+    // with `FBGXY_PROFILE=1` in the environment to get a breakdown of
+    // time spent in read-from-BAM vs walk vs clump vs pileup-insert.
+    // Costs ~1 ns per call; off by default.
+    let profile = std::env::var("FBGXY_PROFILE").is_ok();
+    let mut t_read = std::time::Duration::ZERO;
+    let mut t_walk = std::time::Duration::ZERO;
+    let mut t_clump = std::time::Duration::ZERO;
+    let mut t_insert = std::time::Duration::ZERO;
+
     let mut record = bam::Record::new();
-    while let Some(result) = bam_reader.read(&mut record) {
+    loop {
+        let t0 = std::time::Instant::now();
+        let step = bam_reader.read(&mut record);
+        if profile {
+            t_read += t0.elapsed();
+        }
+        let Some(result) = step else { break };
         result.context("BAM record read failed")?;
         if record.tid() < 0 {
             continue;
@@ -908,15 +924,33 @@ fn run_call(cli: &Cli) -> Result<()> {
             );
         }
         n_reads += 1;
+
+        let t1 = std::time::Instant::now();
         let observations = match walk_record(&record, &current_ref, 0, &filter) {
             Some(v) => v,
             None => {
                 n_filtered += 1;
+                if profile {
+                    t_walk += t1.elapsed();
+                }
                 continue;
             }
         };
+        if profile {
+            t_walk += t1.elapsed();
+        }
+
+        let t2 = std::time::Instant::now();
         let observations = clump_observations(&observations, cli.haplotype_length);
+        if profile {
+            t_clump += t2.elapsed();
+        }
+
+        let t3 = std::time::Instant::now();
         pileup.add_read_observations(tid, observations);
+        if profile {
+            t_insert += t3.elapsed();
+        }
     }
 
     info!(
@@ -925,6 +959,16 @@ fn run_call(cli: &Cli) -> Result<()> {
         n_positions = pileup.positions.len(),
         "pileup complete"
     );
+    if profile {
+        let total_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        info!(
+            t_read_ms = total_ms(t_read),
+            t_walk_ms = total_ms(t_walk),
+            t_clump_ms = total_ms(t_clump),
+            t_insert_ms = total_ms(t_insert),
+            "pileup-stage breakdown (FBGXY_PROFILE=1)"
+        );
+    }
 
     // Re-fetch ref per tid as we iterate — same pattern as the dump
     // path. Positions are in (tid, pos) order thanks to the BTreeMap.
