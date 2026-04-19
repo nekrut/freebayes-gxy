@@ -106,6 +106,16 @@ struct Cli {
     #[arg(long = "tile-size", default_value_t = 100_000, value_name = "BP")]
     tile_size: u64,
 
+    /// Number of background threads to hand to htslib for BGZF
+    /// decompression of the input BAM (M5 Phase G). `0` (default)
+    /// leaves the reader single-threaded, matching M5-A..M5-F
+    /// behaviour. Values `> 0` call `bam::Reader::set_threads(n)`;
+    /// htslib decodes blocks in a worker pool while the main thread
+    /// does CIGAR/pileup work. Independent of `--threads`, which
+    /// controls the per-site call stage.
+    #[arg(long = "bam-threads", default_value_t = 0, value_name = "N")]
+    bam_threads: usize,
+
     /// Input BAM file (positional, matches upstream freebayes).
     #[arg(value_name = "BAM")]
     bam: PathBuf,
@@ -872,6 +882,11 @@ fn run_call_parallel(cli: &Cli) -> Result<()> {
     // --- Single-threaded pileup construction ---
     let mut bam_reader = bam::Reader::from_path(&cli.bam)
         .with_context(|| format!("failed to open BAM {:?}", cli.bam))?;
+    if cli.bam_threads > 0 {
+        bam_reader
+            .set_threads(cli.bam_threads)
+            .with_context(|| format!("bam::Reader::set_threads({})", cli.bam_threads))?;
+    }
     let filter = ReadFilter::default();
     let mut pileup = Pileup::default();
     let mut n_reads: u64 = 0;
@@ -977,6 +992,11 @@ fn run_call(cli: &Cli) -> Result<()> {
         .with_context(|| format!("failed to open reference FASTA {:?}", cli.fasta))?;
     let mut bam_reader = bam::Reader::from_path(&cli.bam)
         .with_context(|| format!("failed to open BAM {:?}", cli.bam))?;
+    if cli.bam_threads > 0 {
+        bam_reader
+            .set_threads(cli.bam_threads)
+            .with_context(|| format!("bam::Reader::set_threads({})", cli.bam_threads))?;
+    }
     let contigs = read_bam_contigs(&cli.bam)?;
     let target_names: Vec<String> = contigs.iter().map(|c| c.name.clone()).collect();
     let target_lens: Vec<u64> = contigs.iter().map(|c| c.length).collect();

@@ -87,10 +87,11 @@ All parity reports: `parity-report-m3.md` through
 | **M5-D** | Lazy REF-run materialisation: keep REF obs as intervals, materialise at call sites only. | **19.9× single-threaded speedup.** |
 | M5-E | Head-to-head on 100 kb vs upstream + `freebayes-parallel`. | gxy-t1 = 4.7× upstream, 3.9× `freebayes-parallel -j 8`. |
 | M5-F | Chromosome-scale (1 Mb) benchmark. | gxy-t1 = 7.9× upstream serial, 2.1× `freebayes-parallel -j 8`. Thread scaling saturates (bam::Reader::read + walk is now the wall). 16× RSS overhead flagged. |
+| M5-G | Optional `--bam-threads N` (htslib BGZF decoder pool). | 2.4× on the read stage but only ~13% of wall, so no visible speedup on this fixture. Flag kept as a no-cost knob for network/dense BAMs. |
 
 Reports: `threading-report-m5{a,b,c-experiment}.md`,
 `profile-report-m5c.md`, `performance-report-m5d.md`,
-`bench-report-m5{e,f}.md`.
+`bench-report-m5{e,f}.md`, `perf-report-m5g.md`.
 
 ## Moral
 
@@ -207,6 +208,7 @@ In descending order of impact:
 | M5-D | Lazy REF-run materialisation — 19.9× speedup. | `performance-report-m5d.md` |
 | M5-E | Head-to-head vs upstream + `freebayes-parallel` (100 kb). | `bench-report-m5e.md` |
 | M5-F | Chromosome-scale (1 Mb) benchmark + memory caveat. | `bench-report-m5f.md` |
+| M5-G | `--bam-threads` (htslib BGZF decoder pool) — works, bounded. | `perf-report-m5g.md` |
 
 ## Parity fixtures
 
