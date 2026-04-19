@@ -168,6 +168,7 @@ mod tests {
             read_position: 0,
             is_proper_pair: true,
             read_ref_start: 0,
+            per_base_quals: Vec::new(),
         }
     }
 

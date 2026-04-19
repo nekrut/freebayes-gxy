@@ -236,6 +236,7 @@ pub fn walk_alignment(
                             read_position: rp,
                             is_proper_pair,
                             read_ref_start: read.pos,
+                            per_base_quals: Vec::new(),
                         });
                     }
                 }
@@ -276,6 +277,7 @@ pub fn walk_alignment(
                             read_position: rp,
                             is_proper_pair,
                             read_ref_start: read.pos,
+                            per_base_quals: Vec::new(),
                         });
                     }
                 }
@@ -352,20 +354,27 @@ fn walk_match_run(
                     return;
                 }
                 let run_bases = read.seq[start_rp..start_rp + length].to_vec();
+                let per_base_quals = read.quals[start_rp..start_rp + length].to_vec();
                 debug_assert_eq!(run_bases.len(), length);
+                debug_assert_eq!(per_base_quals.len(), length);
+                // Sum of per-base BQ across the run — VCF `QR` field.
+                // Upstream stores `MAPPINGQUALITY` as the *scalar*
+                // quality on the Allele (AlleleParser.cpp:1484, 1621)
+                // but accumulates per-base BQ into QR. We capture both:
+                // the per-base vec drives downstream per-position BQ
+                // after the fb-cli pileup decomposes the run, and the
+                // sum here matches what upstream's VCF reports.
+                let bq_sum: u32 = per_base_quals.iter().map(|&b| b as u32).sum();
                 out.push(AlleleObservation {
                     allele: Allele::reference(start_sp, run_bases),
                     read_name: read_name.to_string(),
                     mapq,
-                    // Upstream stores `MAPPINGQUALITY` as the reference
-                    // allele's quality scalar (AlleleParser.cpp:1484, 1621);
-                    // we keep it as a scalar here — not multiplied by run
-                    // length — so single-observation math stays comparable.
-                    base_quality_sum: mapq as u32,
+                    base_quality_sum: bq_sum,
                     strand,
                     read_position: start_rp,
                     is_proper_pair,
                     read_ref_start: read.pos,
+                    per_base_quals,
                 });
             }
         };
@@ -407,6 +416,7 @@ fn walk_match_run(
                     read_position: *rp,
                     is_proper_pair,
                     read_ref_start: read.pos,
+                    per_base_quals: Vec::new(),
                 });
             } else {
                 // Non-ATGC read base (typically 'N'). Upstream emits an
@@ -421,6 +431,7 @@ fn walk_match_run(
                     read_position: *rp,
                     is_proper_pair,
                     read_ref_start: read.pos,
+                    per_base_quals: Vec::new(),
                 });
             }
         }
@@ -501,7 +512,11 @@ mod tests {
         assert_eq!(obs[0].allele.length, 10);
         assert_eq!(obs[0].allele.ref_seq, b"ACGTACGTAC");
         assert_eq!(obs[0].read_position, 0);
-        assert_eq!(obs[0].base_quality_sum, 60); // == mapq
+        // Per-base BQ fix (M4-E): the walker now sums per-base Phred
+        // scores across the run rather than storing MAPQ as a scalar.
+        // 10 bases × Q30 = 300. `per_base_quals` carries the breakdown.
+        assert_eq!(obs[0].base_quality_sum, 300);
+        assert_eq!(obs[0].per_base_quals, vec![30u8; 10]);
     }
 
     #[test]

@@ -368,11 +368,21 @@ impl Pileup {
                     for offset in 0..obs.allele.length {
                         let pos = obs.allele.position + offset as i64;
                         let byte = obs.allele.ref_seq[offset];
+                        // Per-position BQ: prefer the walker's cached
+                        // per_base_quals slice (real Phred-scaled BQ),
+                        // fall back to the obs-level scalar if somehow
+                        // missing (e.g. during test construction).
+                        let per_pos_bq: u32 = obs
+                            .per_base_quals
+                            .get(offset)
+                            .copied()
+                            .map(u32::from)
+                            .unwrap_or(obs.base_quality_sum);
                         let per_pos = AlleleObservation {
                             allele: Allele::reference(pos, vec![byte]),
                             read_name: obs.read_name.clone(),
                             mapq: obs.mapq,
-                            base_quality_sum: obs.base_quality_sum,
+                            base_quality_sum: per_pos_bq,
                             strand: obs.strand,
                             read_position: obs.read_position + offset,
                             is_proper_pair: obs.is_proper_pair,
@@ -380,6 +390,10 @@ impl Pileup {
                             // call_site can filter REF observations at indel
                             // sites (drift 2 fix).
                             read_ref_start: obs.read_ref_start,
+                            // Per-position refs have a single BQ which we
+                            // store in `base_quality_sum`; leave the vec
+                            // empty so downstream code uses the scalar.
+                            per_base_quals: Vec::new(),
                         };
                         self.positions.entry((tid, pos)).or_default().push(per_pos);
                     }

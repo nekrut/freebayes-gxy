@@ -239,6 +239,19 @@ pub struct AlleleObservation {
     /// position can't distinguish REF from INS/DEL because it doesn't
     /// see the anchor base at `pos - 1`.
     pub read_ref_start: i64,
+    /// Per-base Phred qualities underlying this observation.
+    ///
+    /// Populated for multi-base observations where the caller needs
+    /// access to the per-base signal — currently just
+    /// [`AlleleKind::Reference`] runs, where the downstream pileup
+    /// decomposes the run into per-position single-base REF obs and
+    /// needs each base's own BQ (not the run's MAPQ scalar) to
+    /// produce VCF QR values matching upstream.
+    ///
+    /// Empty for all other kinds — SNP / Null use the scalar
+    /// [`Self::base_quality_sum`] directly; INS / DEL pass through the
+    /// simplified M1 scaling.
+    pub per_base_quals: Vec<u8>,
 }
 
 #[cfg(test)]
