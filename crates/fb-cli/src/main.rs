@@ -350,30 +350,123 @@ fn read_bam_contigs(path: &Path) -> Result<Vec<Contig>> {
 // M3 Phase C-2: per-position pileup + Bayesian caller
 // ---------------------------------------------------------------------------
 
-/// Per-position pileup of allele observations.
+/// Pileup of allele observations, split into **variant sites** and
+/// **reference runs** so we don't pay the O(total aligned bases)
+/// allocation cost of decomposing every REF run into per-position
+/// observations.
 ///
-/// Reference runs from the M1 CIGAR walker cover many positions with a
-/// single observation; this aggregator **decomposes** each ref run into
-/// per-position single-base Reference observations so the genotype
-/// model can count per-site depth correctly. Non-reference observations
-/// (SNP, INS, DEL, Complex) are bucketed at their anchor position
-/// as-is.
+/// Before M5 Phase D the pileup materialised a
+/// `BTreeMap<(tid, pos), Vec<AlleleObservation>>` at ingest — with a
+/// separate `AlleleObservation` at every base of every REF run. On
+/// the 100 kb benchmark fixture that was 95 %+ of wall-clock
+/// (3M allocations × 3 heap objects each = ~9M allocs) even though
+/// ~99 % of those entries were never consumed (pure-REF positions
+/// short-circuit in `call_site`). See `docs/profile-report-m5c.md`.
 ///
-/// **Quality scalar caveat:** decomposed per-position Reference
-/// observations inherit the parent run's `base_quality_sum`, which the
-/// M1 walker sets to the read's `mapq` (upstream's convention — see
-/// `fb_core::pileup::walk_match_run`). That is accurate for
-/// single-observation math but does not recover per-base BQ for the
-/// run's interior. Fixing this is a Phase C-3 / M4 task: either emit
-/// per-position Reference observations from the walker directly, or
-/// cache per-base BQs on the run and index them here.
+/// The Phase D shape:
+/// - `variant_sites` holds per-position observation vectors **only**
+///   for positions where at least one non-REF event (SNP / INS / DEL
+///   / Complex) landed. These are the sites that `call_site` actually
+///   visits.
+/// - `ref_runs_per_tid` stores REF runs as intervals, sorted by
+///   start. At call time, `runs_covering(tid, pos)` binary-searches
+///   for the ~depth runs overlapping a candidate site; we
+///   materialise their single-base REF observations on demand.
 ///
-/// Memory cost: O(total aligned bases). Fine for synthetic test inputs
-/// and small regions; a streaming or interval-tree backed aggregator is
-/// a Phase C-3 optimisation for full-WGS runs.
+/// Semantics are byte-identical to the old design — the materialised
+/// per-position REF observation inherits the parent run's per-base
+/// Phred (via `ref_seq[offset]` and `per_base_quals[offset]`), the
+/// read's `read_ref_start` for the drift-2 event-span filter, and the
+/// strand / mapq / name needed for the per-read dedupe. All M3 / M4
+/// invariants are preserved.
 #[derive(Default)]
 struct Pileup {
-    positions: BTreeMap<(i32, i64), Vec<AlleleObservation>>,
+    variant_sites: BTreeMap<(i32, i64), Vec<AlleleObservation>>,
+    ref_runs_per_tid: HashMap<i32, TidRuns>,
+}
+
+/// Per-contig collection of REF runs. Kept sorted by `start`, with
+/// `max_len` cached so `runs_covering` can bound its search window.
+#[derive(Default)]
+struct TidRuns {
+    runs: Vec<RefRun>,
+    max_len: usize,
+    // `true` once `runs` has been sorted by start. `add_run` sets
+    // `false`; `ensure_sorted` (called before the first query) sorts.
+    sorted: bool,
+}
+
+/// A single contiguous REF match run produced by the M1 walker.
+/// Materialisation of per-position REF observations happens at
+/// `call_site` time via `materialize_at`.
+#[derive(Clone)]
+struct RefRun {
+    start: i64,
+    length: usize,
+    read_name: String,
+    mapq: u8,
+    strand: Strand,
+    read_position: usize,
+    is_proper_pair: bool,
+    read_ref_start: i64,
+    per_base_quals: Vec<u8>,
+    ref_seq: Vec<u8>,
+    /// Fallback BQ scalar for decomposition when `per_base_quals` is
+    /// shorter than `length` (shouldn't happen for walker-emitted
+    /// runs, but test observations can construct with empty vec).
+    fallback_bq: u32,
+}
+
+impl RefRun {
+    /// True if this run covers the given 0-based reference position.
+    #[inline]
+    fn covers(&self, pos: i64) -> bool {
+        self.start <= pos && pos < self.start + self.length as i64
+    }
+
+    /// Materialise the single-base REF `AlleleObservation` at `pos`
+    /// from this run. Caller has already verified `covers(pos)`.
+    fn materialize_at(&self, pos: i64) -> AlleleObservation {
+        let offset = (pos - self.start) as usize;
+        let byte = self.ref_seq[offset];
+        let per_pos_bq: u32 = self
+            .per_base_quals
+            .get(offset)
+            .copied()
+            .map(u32::from)
+            .unwrap_or(self.fallback_bq);
+        AlleleObservation {
+            allele: Allele::reference(pos, vec![byte]),
+            read_name: self.read_name.clone(),
+            mapq: self.mapq,
+            base_quality_sum: per_pos_bq,
+            strand: self.strand,
+            read_position: self.read_position + offset,
+            is_proper_pair: self.is_proper_pair,
+            read_ref_start: self.read_ref_start,
+            per_base_quals: Vec::new(),
+        }
+    }
+}
+
+impl TidRuns {
+    fn ensure_sorted(&mut self) {
+        if !self.sorted {
+            self.runs.sort_unstable_by_key(|r| r.start);
+            self.sorted = true;
+        }
+    }
+
+    /// Iterator over runs covering `pos`. Relies on `runs` being
+    /// sorted by start. Narrows via two `partition_point` calls
+    /// bounded by `max_len`, then filters the candidate window.
+    fn covering(&self, pos: i64) -> impl Iterator<Item = &RefRun> {
+        debug_assert!(self.sorted, "TidRuns::covering requires ensure_sorted()");
+        let min_start = pos.saturating_sub(self.max_len as i64 - 1).max(0);
+        let lo = self.runs.partition_point(|r| r.start < min_start);
+        let hi = self.runs.partition_point(|r| r.start <= pos);
+        self.runs[lo..hi].iter().filter(move |r| r.covers(pos))
+    }
 }
 
 impl Pileup {
@@ -381,50 +474,33 @@ impl Pileup {
         for obs in observations {
             match obs.allele.kind {
                 AlleleKind::Reference => {
-                    // Decompose the ref run into per-position
-                    // single-base Reference observations. The run's
-                    // `ref_seq` is the aligned read bases (which equal
-                    // the ref bases by construction — see `Allele::
-                    // reference` in fb-core).
-                    for offset in 0..obs.allele.length {
-                        let pos = obs.allele.position + offset as i64;
-                        let byte = obs.allele.ref_seq[offset];
-                        // Per-position BQ: prefer the walker's cached
-                        // per_base_quals slice (real Phred-scaled BQ),
-                        // fall back to the obs-level scalar if somehow
-                        // missing (e.g. during test construction).
-                        let per_pos_bq: u32 = obs
-                            .per_base_quals
-                            .get(offset)
-                            .copied()
-                            .map(u32::from)
-                            .unwrap_or(obs.base_quality_sum);
-                        let per_pos = AlleleObservation {
-                            allele: Allele::reference(pos, vec![byte]),
-                            read_name: obs.read_name.clone(),
-                            mapq: obs.mapq,
-                            base_quality_sum: per_pos_bq,
-                            strand: obs.strand,
-                            read_position: obs.read_position + offset,
-                            is_proper_pair: obs.is_proper_pair,
-                            // Preserve the parent read's alignment start so
-                            // call_site can filter REF observations at indel
-                            // sites (drift 2 fix).
-                            read_ref_start: obs.read_ref_start,
-                            // Per-position refs have a single BQ which we
-                            // store in `base_quality_sum`; leave the vec
-                            // empty so downstream code uses the scalar.
-                            per_base_quals: Vec::new(),
-                        };
-                        self.positions.entry((tid, pos)).or_default().push(per_pos);
+                    // Phase D: park REF runs as intervals; no per-
+                    // position decomposition.
+                    let entry = self.ref_runs_per_tid.entry(tid).or_default();
+                    let length = obs.allele.length;
+                    if length > entry.max_len {
+                        entry.max_len = length;
                     }
+                    entry.sorted = false;
+                    entry.runs.push(RefRun {
+                        start: obs.allele.position,
+                        length,
+                        read_name: obs.read_name,
+                        mapq: obs.mapq,
+                        strand: obs.strand,
+                        read_position: obs.read_position,
+                        is_proper_pair: obs.is_proper_pair,
+                        read_ref_start: obs.read_ref_start,
+                        per_base_quals: obs.per_base_quals,
+                        ref_seq: obs.allele.ref_seq,
+                        fallback_bq: obs.base_quality_sum,
+                    });
                 }
                 AlleleKind::Null => {
-                    // Soft-clip / N-base observations don't inform the
-                    // Bayesian model; drop them at the pileup stage.
+                    // Soft-clip / N-base — not informative.
                 }
                 _ => {
-                    self.positions
+                    self.variant_sites
                         .entry((tid, obs.allele.position))
                         .or_default()
                         .push(obs);
@@ -432,6 +508,35 @@ impl Pileup {
             }
         }
     }
+
+    /// Sort every contig's REF run list by start. Must be called
+    /// once after all `add_read_observations` and before any
+    /// `covering` query.
+    fn finalize(&mut self) {
+        for runs in self.ref_runs_per_tid.values_mut() {
+            runs.ensure_sorted();
+        }
+    }
+}
+
+/// Build the combined observation vector for a candidate site: the
+/// site's variant observations (passed in, already held by the
+/// pileup) followed by the per-position REF observations materialised
+/// from every REF run that covers `pos`.
+fn materialize_site_observations(
+    pileup: &Pileup,
+    tid: i32,
+    pos: i64,
+    variant_obs: &[AlleleObservation],
+) -> Vec<AlleleObservation> {
+    let mut combined: Vec<AlleleObservation> = Vec::with_capacity(variant_obs.len() + 32);
+    combined.extend_from_slice(variant_obs);
+    if let Some(runs) = pileup.ref_runs_per_tid.get(&tid) {
+        for run in runs.covering(pos) {
+            combined.push(run.materialize_at(pos));
+        }
+    }
+    combined
 }
 
 /// Given a position's observation bucket, assemble the candidate
@@ -795,11 +900,12 @@ fn run_call_parallel(cli: &Cli) -> Result<()> {
         let observations = clump_observations(&observations, cli.haplotype_length);
         pileup.add_read_observations(tid, observations);
     }
+    pileup.finalize();
 
     info!(
         n_reads = n_reads,
         n_filtered = n_filtered,
-        n_positions = pileup.positions.len(),
+        n_variant_sites = pileup.variant_sites.len(),
         "pileup complete"
     );
 
@@ -814,26 +920,29 @@ fn run_call_parallel(cli: &Cli) -> Result<()> {
         ..Parameters::default()
     };
 
-    let positions: Vec<((i32, i64), &Vec<AlleleObservation>)> =
-        pileup.positions.iter().map(|(k, v)| (*k, v)).collect();
+    // Iterate only the positions that actually carry a variant
+    // observation — pure-REF sites never need to be called. For each
+    // such site, merge the variant observations with REF obs
+    // materialised on-demand from overlapping ref runs.
+    let sites: Vec<((i32, i64), &Vec<AlleleObservation>)> =
+        pileup.variant_sites.iter().map(|(k, v)| (*k, v)).collect();
 
-    // Target 4 chunks per thread so Rayon has room to rebalance.
-    let chunk_size = (positions.len() / (cli.threads.max(1) * 4))
+    let chunk_size = (sites.len() / (cli.threads.max(1) * 4))
         .max(1)
         .min(cli.tile_size as usize);
 
     let site_calls_unsorted: Vec<SiteCall> = pool.install(|| {
-        positions
+        sites
             .par_chunks(chunk_size)
             .flat_map(|chunk| -> Vec<SiteCall> {
                 let mut local: Vec<SiteCall> = Vec::with_capacity(chunk.len());
-                for ((tid, pos), observations) in chunk {
+                for ((tid, pos), variant_obs) in chunk {
                     let reference = &ref_cache[*tid as usize];
                     let Some(&ref_base) = reference.get(*pos as usize) else {
                         continue;
                     };
-                    if let Some(call) = call_site(*tid, *pos, observations, ref_base, cli, &params)
-                    {
+                    let combined = materialize_site_observations(&pileup, *tid, *pos, variant_obs);
+                    if let Some(call) = call_site(*tid, *pos, &combined, ref_base, cli, &params) {
                         local.push(call);
                     }
                 }
@@ -953,10 +1062,11 @@ fn run_call(cli: &Cli) -> Result<()> {
         }
     }
 
+    pileup.finalize();
     info!(
         n_reads = n_reads,
         n_filtered = n_filtered,
-        n_positions = pileup.positions.len(),
+        n_variant_sites = pileup.variant_sites.len(),
         "pileup complete"
     );
     if profile {
@@ -970,21 +1080,22 @@ fn run_call(cli: &Cli) -> Result<()> {
         );
     }
 
-    // Re-fetch ref per tid as we iterate — same pattern as the dump
-    // path. Positions are in (tid, pos) order thanks to the BTreeMap.
+    // Iterate variant sites only; materialise REF obs on demand from
+    // overlapping runs in the Phase D ref_runs_per_tid index.
     let mut site_calls: Vec<SiteCall> = Vec::new();
     let mut current_tid: i32 = -1;
     let mut current_ref: Vec<u8> = Vec::new();
-    for ((tid, pos), observations) in pileup.positions.iter() {
+    for ((tid, pos), variant_obs) in pileup.variant_sites.iter() {
         if *tid != current_tid {
             current_ref = fetch_contig(&fasta, &target_names, &target_lens, *tid as usize)?;
             current_tid = *tid;
         }
         let ref_base = match current_ref.get(*pos as usize) {
             Some(&b) => b,
-            None => continue, // out-of-bounds (shouldn't happen post-walker)
+            None => continue,
         };
-        if let Some(call) = call_site(*tid, *pos, observations, ref_base, cli, &params) {
+        let combined = materialize_site_observations(&pileup, *tid, *pos, variant_obs);
+        if let Some(call) = call_site(*tid, *pos, &combined, ref_base, cli, &params) {
             site_calls.push(call);
         }
     }
