@@ -9,9 +9,9 @@ clean embeddable library API for Galaxy and nf-core pipelines.
 
 **Status (2026-04-19):** single-sample calling is end-to-end functional.
 F1 = 1.0000 vs synthetic truth on 2 kb / 10 kb / 100 kb / 1 Mb fixtures;
-GL values byte-identical to upstream `--legacy-gls`; 4.7–7.9× faster
-single-threaded than upstream serial (data: M5-E / M5-F). 129/129 tests
-pass; `clippy` / `fmt` / `cargo doc` clean.
+GL values byte-identical to upstream `--legacy-gls`; **8.6–17.3× faster
+than upstream serial** (data: M5-E / M5-F / M5-H). 129/129 tests pass;
+`clippy` / `fmt` / `cargo doc` clean.
 
 See [`docs/README.md`](docs/README.md) for the full project dossier
 (architecture, performance story, parity story, roadmap) and

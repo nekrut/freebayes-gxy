@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+mimalloc = { version = "0.1", default-features = false }
 rayon.workspace = true
 rust-htslib.workspace = true
 thiserror.workspace = true

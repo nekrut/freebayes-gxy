@@ -27,6 +27,15 @@ use rust_htslib::bam::{self, Read as _};
 use rust_htslib::faidx;
 use tracing::{debug, info, warn};
 
+// mimalloc has noticeably lower cross-thread free overhead than the
+// default glibc allocator, which matters whenever the walker ingests
+// tens of millions of small heap cells and any subset of them gets
+// freed on a different thread (rayon call-stage workers, future
+// producer/consumer experiments, etc.). ~5 % win at t=1 on the
+// chrscale fixture, free.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// freebayes-gxy — a Rust reimplementation of freebayes.
 #[derive(Debug, Parser)]
 #[command(name = "freebayes-gxy", version, about, long_about = None)]

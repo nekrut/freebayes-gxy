@@ -16,9 +16,9 @@ single thread of the story so far. For the canonical design, see
 | **Records emitted** | Identical to upstream on every parity fixture (100% record parity). |
 | **F1 vs synthetic truth** | **1.0000** on 2 kb / 10 kb / 100 kb / 1 Mb fixtures. |
 | **GL numeric parity vs upstream `--legacy-gls`** | **Byte-identical** across all SNP sites. |
-| **Wall-clock (100 kb, single-threaded)** | **4.7×** faster than upstream serial, **3.9×** faster than `freebayes-parallel -j 8`. |
-| **Wall-clock (1 Mb, single-threaded)** | **7.9×** faster than upstream serial, **2.1×** faster than `freebayes-parallel -j 8`. |
-| **Wall-clock (1 Mb, -t 8)** | Only marginally better than -t 1 — thread scaling saturated. |
+| **Wall-clock (100 kb, single-threaded)** | **8.6×** faster than upstream serial, **7.0×** faster than `freebayes-parallel -j 8` (post-M5-H). |
+| **Wall-clock (1 Mb, single-threaded)** | **12.7×** faster than upstream serial, **3.4×** faster than `freebayes-parallel -j 8` (post-M5-H). |
+| **Wall-clock (1 Mb, -t 4 bt=4)** | **17.3×** upstream serial, **4.7×** `freebayes-parallel -j 8` (post-M5-H). |
 | **Peak RSS (1 Mb)** | ~230 MB (**16×** upstream, 40× `freebayes-parallel` workers). |
 | **Test suite** | 129/129 pass; `clippy`, `fmt`, `cargo doc` clean. |
 
@@ -88,10 +88,11 @@ All parity reports: `parity-report-m3.md` through
 | M5-E | Head-to-head on 100 kb vs upstream + `freebayes-parallel`. | gxy-t1 = 4.7× upstream, 3.9× `freebayes-parallel -j 8`. |
 | M5-F | Chromosome-scale (1 Mb) benchmark. | gxy-t1 = 7.9× upstream serial, 2.1× `freebayes-parallel -j 8`. Thread scaling saturates (bam::Reader::read + walk is now the wall). 16× RSS overhead flagged. |
 | M5-G | Optional `--bam-threads N` (htslib BGZF decoder pool). | 2.4× on the read stage but only ~13% of wall, so no visible speedup on this fixture. Flag kept as a no-cost knob for network/dense BAMs. |
+| M5-H | Producer/consumer pipeline attempted, found glibc-malloc pathological on cross-thread free. Swapped to `mimalloc` — delivered 1.5–1.8× wall reduction with 3 lines of code instead of 100. |
 
 Reports: `threading-report-m5{a,b,c-experiment}.md`,
 `profile-report-m5c.md`, `performance-report-m5d.md`,
-`bench-report-m5{e,f}.md`, `perf-report-m5g.md`.
+`bench-report-m5{e,f}.md`, `perf-report-m5{g,h}.md`.
 
 ## Moral
 
@@ -209,6 +210,7 @@ In descending order of impact:
 | M5-E | Head-to-head vs upstream + `freebayes-parallel` (100 kb). | `bench-report-m5e.md` |
 | M5-F | Chromosome-scale (1 Mb) benchmark + memory caveat. | `bench-report-m5f.md` |
 | M5-G | `--bam-threads` (htslib BGZF decoder pool) — works, bounded. | `perf-report-m5g.md` |
+| M5-H | mimalloc global allocator — 1.5–1.8× wall, no code-flow change. | `perf-report-m5h.md` |
 
 ## Parity fixtures
 
